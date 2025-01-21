@@ -622,57 +622,76 @@ bpm_initialized = False  # 标志：BPM 初始化是否完成
 stop_detected = False  # 初始化停顿检测标志
 prev_position = None   # 初始化上一帧位置
 
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("无法读取摄像头帧，退出程序。")
+            break
 
-# MIDI 播放流程
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("无法读取摄像头帧，退出程序。")
-        break
+        frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
 
-    frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
+        # 阶段 1: 初始化 BPM
+        if not bpm_initialized:
+            cv2.putText(frame, "Initializing BPM, wave and stop to record...", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            bpm = detect_bpm(cap, hand_hist)  # 调用 BPM 检测函数
+            if bpm is not None:
+                note_durations = calculate_note_durations(bpm)  # 更新音符时长
+                bpm_initialized = True
+                print(f"BPM 初始化完成，值为 {bpm:.2f}，进入 MIDI 播放流程。")
+            else:
+                print("BPM 初始化失败，程序退出。")
+                break
+            continue
 
-    # 使用直方图检测手部区域
-    if hand_hist is not None:
-        masked_frame = hist_masking(frame, hand_hist)
-        contours_list = contours(masked_frame)
+        # 阶段 2: MIDI 播放流程
+        if hand_hist is not None:
+            masked_frame = hist_masking(frame, hand_hist)
+            contours_list = contours(masked_frame)
 
-        if contours_list:
-            max_contour = max(contours_list, key=cv2.contourArea)
-            if cv2.contourArea(max_contour) > 500:
-                cnt_centroid = centroid(max_contour)
-                if cnt_centroid is not None:
-                    current_time = time.time()
+            if contours_list:
+                max_contour = max(contours_list, key=cv2.contourArea)
+                if cv2.contourArea(max_contour) > 500:
+                    cnt_centroid = centroid(max_contour)
+                    if cnt_centroid is not None:
+                        current_time = time.time()
 
-                    # 绘制手势中心点
-                    cv2.circle(frame, cnt_centroid, 5, [255, 0, 255], -1)
+                        # 绘制手势中心点
+                        cv2.circle(frame, cnt_centroid, 5, [255, 0, 255], -1)
 
-                    # 调用通用停顿检测逻辑
-                    if prev_position is not None:
-                        stop_detected_local, motion_amplitude, stop_detected = detect_pause(
-                            motion_amplitude, prev_position, cnt_centroid, stop_detected
-                        )
-                        if stop_detected_local:
-                            print(f"检测到停顿：时间戳 {current_time:.2f}")
-                            detect_pause_and_calculate_bpm(cnt_centroid, current_time, frame)
+                        # 调用通用停顿检测逻辑
+                        if prev_position is not None:
+                            stop_detected_local, motion_amplitude, stop_detected = detect_pause(
+                                motion_amplitude, prev_position, cnt_centroid, stop_detected
+                            )
+                            if stop_detected_local:
+                                print(f"检测到停顿：时间戳 {current_time:.2f}")
+                                detect_pause_and_calculate_bpm(cnt_centroid, current_time, frame)
 
-                            # 播放当前节拍音符
-                            if current_beat < total_beats:
-                                play_midi_beat_persistent(all_beats_notes, current_beat, bpm, volume, frame)
-                                current_beat += 1
+                                # 播放当前节拍音符
+                                if current_beat < total_beats:
+                                    play_midi_beat_persistent(beats_notes, current_beat, bpm, volume, frame)
+                                    current_beat += 1
 
-                    prev_position = cnt_centroid
+                        prev_position = cnt_centroid
 
-    # 持续绘制最后一次检测到的停顿信息
-    if last_pause_info["bpm"] is not None:
-        cv2.putText(frame, f"BPM: {last_pause_info['bpm']:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        for idx, tap_time in enumerate(last_pause_info["tap_times"][-4:], 1):  # 显示最近 4 次停顿
-            cv2.putText(frame, f"Stop {idx}: {tap_time:.2f}s", (10, 60 + idx * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        # 显示当前 BPM 和最近停顿信息
+        if last_pause_info["bpm"] is not None:
+            cv2.putText(frame, f"BPM: {last_pause_info['bpm']:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            for idx, tap_time in enumerate(last_pause_info["tap_times"][-4:], 1):  # 显示最近 4 次停顿
+                cv2.putText(frame, f"Stop {idx}: {tap_time:.2f}s", (10, 60 + idx * 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
 
-    # 显示摄像头帧
-    cv2.imshow("Hand Gesture MIDI Control", frame)
+        # 显示摄像头帧
+        cv2.imshow("Hand Gesture MIDI Control", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    cleanup_fluidsynth()
 
 
