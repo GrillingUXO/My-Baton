@@ -115,18 +115,22 @@ def select_midi_and_soundfont_files():
     return midi_file_path
 
 
+
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats):
     """
     使用 MediaPipe 检测两只手的动作并处理逻辑：
     1. 记录第一只出现的手是左手还是右手，并绑定为节奏手。
     2. 第二只出现的手绑定为变化手。
-    3. 节奏手：检测停顿播放 MIDI。
+    3. 节奏手：检测滚动方向，并根据移动速度和移动距离触发 MIDI 音符播放。
     4. 变化手：根据手势和与躯干的相对距离调节音量。
     """
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
-    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time
+    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, prev_time
 
     avg_motion = 0  # 初始化 avg_motion，防止未赋值错误
+    recognized_hand_mouvement_scrolling = None  # 用于存储滚动方向的变量
+    speed_threshold = 200  # 节奏手移动速度阈值（像素/秒）
+    distance_threshold = 150  # 移动距离阈值（像素）
 
     # 使用 MediaPipe Pose 检测躯干
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -184,34 +188,48 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
-            # 检测手腕点运动和停顿
+            # 检测滚动方向
             if prev_position is not None:
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
+                mouvement_distance = (dx**2 + dy**2)**0.5
+                mouvement_distance_threshold = 0.02 * frame.shape[0]  # 基于画面高度调整阈值
+
+                if mouvement_distance > mouvement_distance_threshold:
+                    # 计算滚动角度
+                    angle = math.degrees(math.atan2(dy, dx))
+                    if -45 <= angle < 45:
+                        recognized_hand_mouvement_scrolling = "Scrolling right"
+                    elif 45 <= angle < 135:
+                        recognized_hand_mouvement_scrolling = "Scrolling up"
+                    elif angle >= 135 or angle < -135:
+                        recognized_hand_mouvement_scrolling = "Scrolling left"
+                    elif -135 <= angle < -45:
+                        recognized_hand_mouvement_scrolling = "Scrolling down"
+                    print(f"节奏手滚动方向: {recognized_hand_mouvement_scrolling}")
+
+                    # 在画面上显示滚动方向
+                    cv2.putText(frame, recognized_hand_mouvement_scrolling, (wrist_pos[0] + 20, wrist_pos[1] - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            # 检测移动速度和距离并播放 MIDI 音符
+            if prev_position is not None and prev_time is not None:
+                current_time = time.time()
+                delta_time = current_time - prev_time
+                dx = wrist_pos[0] - prev_position[0]
+                dy = wrist_pos[1] - prev_position[1]
                 distance = (dx**2 + dy**2)**0.5
-                motion_amplitude.append(distance)
+                speed = distance / delta_time  # 计算速度（像素/秒）
 
-                # 计算平均运动幅度
-                if len(motion_amplitude) > 10:
-                    motion_amplitude.pop(0)
-
-                avg_motion = np.mean(motion_amplitude)
-
-                if avg_motion < STOP_THRESHOLD:  # 检测到停顿
-                    if not stop_detected:
-                        stop_detected = True
-                        current_time = time.time()
-                        print(f"节奏手检测到停顿：时间戳 {current_time:.2f}")
-
-                        # 播放当前节拍音符
-                        if 0 <= current_beat < total_beats:  # 确保 current_beat 在有效范围
-                            play_midi_beat_persistent(beats_notes, current_beat, bpm, volume, frame)
-                            current_beat += 1  # 确保节拍正确递增
-
-                        # 更新 BPM 和动画
-                        detect_pause_and_calculate_bpm(wrist_pos, current_time, frame)
-                else:
-                    stop_detected = False
+                # 当速度和距离均超过阈值时触发音符播放
+                if speed > speed_threshold and distance > distance_threshold:
+                    print(f"检测到速度: {speed:.2f}，移动距离: {distance:.2f}，触发 MIDI 音符播放。")
+                    if 0 <= current_beat < total_beats:  # 确保 current_beat 在有效范围
+                        play_midi_beat_persistent(beats_notes, current_beat, bpm, volume, frame)
+                        current_beat += 1  # 更新节拍
+                prev_time = current_time  # 更新时间戳
+            else:
+                prev_time = time.time()  # 初始化时间戳
 
             # 更新上一帧位置
             prev_position = wrist_pos
@@ -220,7 +238,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             cv2.putText(frame, "Rhythm Hand", (wrist_pos[0] - 50, wrist_pos[1] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 处理变化手逻辑
+        # 处理变化手逻辑（保持不变）
         if control_hand:
             # 绘制骨骼
             mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
@@ -255,6 +273,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             # 标记变化手
             cv2.putText(frame, "Control Hand", (control_wrist_pos[0] - 50, control_wrist_pos[1] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
 
     # 显示运动幅度和停顿状态
     cv2.putText(frame, f"Motion: {avg_motion:.2f}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
