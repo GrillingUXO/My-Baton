@@ -20,7 +20,7 @@ class ProgramState(Enum):
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 
 rhythm_hand_label = None  # 节奏手的左右信息（"Left" 或 "Right"）
@@ -33,7 +33,7 @@ last_distance_to_torso = None  # 记录变化手上一帧与躯干的距离
 
 
 # 在全局变量定义区添加以下变量
-pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
@@ -116,12 +116,12 @@ def select_midi_and_soundfont_files():
 
 
 
-def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats):
+def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
     """
     使用 MediaPipe 检测两只手的动作并处理逻辑：
     1. 记录第一只出现的手是左手还是右手，并绑定为节奏手。
     2. 第二只出现的手绑定为变化手。
-    3. 节奏手：检测滚动方向，并根据移动速度和移动距离触发 MIDI 音符播放。
+    3. 节奏手：检测滚动方向，并根据移动速度和移动距离触发 MIDI 音符播放，记录触发时刻作为 last_stop_time。
     4. 变化手：根据手势和与躯干的相对距离调节音量。
     """
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
@@ -129,8 +129,8 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
     avg_motion = 0  # 初始化 avg_motion，防止未赋值错误
     recognized_hand_mouvement_scrolling = None  # 用于存储滚动方向的变量
-    speed_threshold = 200  # 节奏手移动速度阈值（像素/秒）
-    distance_threshold = 150  # 移动距离阈值（像素）
+    speed_threshold = 300  # 节奏手移动速度阈值（像素/秒）
+    distance_threshold = 200  # 移动距离阈值（像素）
 
     # 使用 MediaPipe Pose 检测躯干
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -224,6 +224,17 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 # 当速度和距离均超过阈值时触发音符播放
                 if speed > speed_threshold and distance > distance_threshold:
                     print(f"检测到速度: {speed:.2f}，移动距离: {distance:.2f}，触发 MIDI 音符播放。")
+                    
+                    # 更新 BPM
+                    if last_stop_time is not None:
+                        interval = current_time - last_stop_time
+                        bpm = max(60, min(200, 60 / interval))  # 限制 BPM 范围
+                        print(f"动态更新 BPM: {bpm:.2f}")
+
+                    # 更新 last_stop_time
+                    last_stop_time = current_time
+
+                    # 播放对应节拍音符
                     if 0 <= current_beat < total_beats:  # 确保 current_beat 在有效范围
                         play_midi_beat_persistent(beats_notes, current_beat, bpm, volume, frame)
                         current_beat += 1  # 更新节拍
@@ -283,7 +294,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         cv2.putText(frame, f"BPM: {last_pause_info['bpm']:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     cv2.putText(frame, f"Velocity: {velocity}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-    return prev_position, stop_detected, current_beat  # 返回更新后的状态
+    return prev_position, stop_detected, current_beat, last_stop_time  # 返回更新后的状态
 
 
 
@@ -447,6 +458,7 @@ def preprocess_midi(midi_file_path):
     Returns:
         - all_beats_notes: A list of lists, where each sublist corresponds to a voice's beats_notes.
         - ticks_per_beat: Number of ticks per beat (PPQN) in the MIDI file.
+        - bpm: The original BPM detected from the MIDI file.
     """
     try:
         midi_data = pretty_midi.PrettyMIDI(midi_file_path)
@@ -497,7 +509,8 @@ def preprocess_midi(midi_file_path):
 
     print(f"MIDI 文件原曲 BPM: {bpm:.2f}")
     print(f"预处理完成，共解析出 {len(all_beats_notes)} 个声部。")
-    return all_beats_notes, ticks_per_beat
+    return all_beats_notes, ticks_per_beat, bpm
+
 
 
 
@@ -505,105 +518,17 @@ def preprocess_midi(midi_file_path):
 midi_file_path = select_midi_and_soundfont_files()
 start_fluidsynth()
 
-# Initialize MIDI playback parameters
-beats_notes, ticks_per_beat = preprocess_midi(midi_file_path)
+
+beats_notes, ticks_per_beat, bpm = preprocess_midi(midi_file_path)
 note_durations = calculate_note_durations(bpm)
 
 
-from queue import Queue
-import threading
 
-
-def detect_bpm(cap, hand_hist):
-    """
-    使用 MediaPipe 检测手部运动和停顿以初始化 BPM。
-    Args:
-        cap: OpenCV VideoCapture 对象。
-        hand_hist: 保持参数一致，但此实现中不使用它。
-    Returns:
-        检测到的 BPM 值。
-    """
-    global hands, mp_drawing, mp_hands
-    print("通过挥动和停顿初始化 BPM。开始挥动时，停顿以记录节拍。按 'q' 键退出。")
-    
-    motion_amplitude = []
-    tap_times = []
-    prev_position = None
-    stop_detected = False
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("无法读取摄像头帧。")
-            return None
-
-        frame = cv2.flip(frame, 1)  # 镜像翻转
-
-        # 使用 MediaPipe Hands 检测手势
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb_frame)
-
-        if result.multi_hand_landmarks:
-            for hand_landmarks in result.multi_hand_landmarks:
-                # 绘制手部骨骼
-                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-                # 获取手腕点位置
-                wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
-                wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
-
-                # 检测手部运动
-                if prev_position is not None:
-                    dx = wrist_pos[0] - prev_position[0]
-                    dy = wrist_pos[1] - prev_position[1]
-                    distance = (dx**2 + dy**2)**0.5
-                    motion_amplitude.append(distance)
-
-                    if len(motion_amplitude) > 10:
-                        motion_amplitude.pop(0)
-
-                    avg_motion = np.mean(motion_amplitude)
-
-                    if avg_motion < STOP_THRESHOLD:
-                        if not stop_detected:
-                            stop_detected = True
-                            tap_time = time.time()
-                            tap_times.append(tap_time)
-                            print(f"记录停顿：第 {len(tap_times)} 次，时间戳：{tap_time:.2f}")
-
-                            if len(tap_times) == 4:  # 如果记录到4次停顿，计算 BPM
-                                print("已完成测试小节，开始计算 BPM。")
-                                intervals = [tap_times[i + 1] - tap_times[i] for i in range(len(tap_times) - 1)]
-                                average_interval = sum(intervals) / len(intervals)
-                                bpm = max(60, 60 / average_interval)  # 限制最低 BPM 为 60
-                                print(f"最终计算的 BPM：{bpm:.2f}")
-                                return bpm
-                    else:
-                        stop_detected = False
-
-                prev_position = wrist_pos
-
-        # 显示当前停顿状态
-        cv2.putText(frame, f"Recorded stops: {len(tap_times)}/4", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        cv2.imshow("BPM Initialization", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    return None
-
-
-note_durations = calculate_note_durations(bpm)
-beats_notes, ticks_per_beat = preprocess_midi(midi_file_path)
 total_beats = len(beats_notes)
-
-
-
 last_pause_info = {"bpm": None, "tap_times": []}
 
 
-
-
+from queue import Queue
 import threading
 
 def detect_pause_and_calculate_bpm(centroid, current_time, frame):
@@ -727,19 +652,36 @@ def main():
 
     print("按 'q' 键退出程序。")
 
-    # 初始化阶段
-    current_state = ProgramState.INITIALIZING_BPM
-
-    # 初始化 MIDI 文件和播放相关变量
     note_durations = None
-    beats_notes, ticks_per_beat = preprocess_midi(midi_file_path)
+    beats_notes, ticks_per_beat, bpm = preprocess_midi(midi_file_path)
     total_beats = len(beats_notes[0]) if beats_notes else 0  # 确保存在有效的节拍数据
+
+    # 使用 MIDI 文件原曲 BPM 初始化
+    bpm = None  # 初始化 BPM 为 None，确保我们明确地从 MIDI 获取
+    if beats_notes:  # 如果解析成功，使用原曲 BPM
+        try:
+            midi_data = pretty_midi.PrettyMIDI(midi_file_path)
+            tempo_changes = midi_data.get_tempo_changes()
+            if tempo_changes[1].size > 0:  # 检测到 BPM 数据
+                bpm = tempo_changes[1][0]
+                print(f"原曲 BPM 初始化为：{bpm:.2f}")
+            else:
+                print("未检测到原曲 BPM，程序无法继续。")
+                cleanup_fluidsynth()
+                exit()
+        except Exception as e:
+            print(f"无法读取原曲 BPM，程序无法继续，错误信息：{e}")
+            cleanup_fluidsynth()
+            exit()
+
+    # 计算音符时值
+    print(f"使用原曲 BPM：{bpm:.2f}")
+    note_durations = calculate_note_durations(bpm)
 
     # 初始化手势相关变量
     stop_detected = False
     prev_position = None
     current_beat = 0
-    bpm = None
     last_stop_time = None  # 初始化 last_stop_time
 
     try:
@@ -752,22 +694,10 @@ def main():
 
             frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
 
-            # 当前状态逻辑
-            if current_state == ProgramState.INITIALIZING_BPM:
-                bpm = detect_bpm(cap, None)  # 调用 BPM 初始化逻辑
-                if bpm is None:
-                    print("用户取消了 BPM 初始化，程序退出。")
-                    break
-
-                note_durations = calculate_note_durations(bpm)
-                current_state = ProgramState.PLAYING_MIDI
-                print(f"BPM 初始化完成，值为 {bpm:.2f}，进入 MIDI 播放流程。")
-
-            elif current_state == ProgramState.PLAYING_MIDI:
-                # 调用处理函数，并更新当前节拍状态
-                prev_position, stop_detected, current_beat, last_stop_time = process_frame_with_hand_detection(
-                    frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time
-                )
+            # MIDI 播放流程
+            prev_position, stop_detected, current_beat, last_stop_time = process_frame_with_hand_detection(
+                frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time
+            )
 
             # 显示摄像头帧
             cv2.imshow("Hand Gesture MIDI Control", frame)
