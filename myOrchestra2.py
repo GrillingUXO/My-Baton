@@ -717,7 +717,6 @@ def play_midi_beat_persistent(beats_notes, beat_index, bpm, volume, frame):
 
 
 
-
 def main():
     # 初始化摄像头
     cap = cv2.VideoCapture(0)
@@ -741,6 +740,7 @@ def main():
     prev_position = None
     current_beat = 0
     bpm = None
+    last_stop_time = None  # 初始化 last_stop_time
 
     try:
         while True:
@@ -765,8 +765,8 @@ def main():
 
             elif current_state == ProgramState.PLAYING_MIDI:
                 # 调用处理函数，并更新当前节拍状态
-                prev_position, stop_detected, current_beat = process_frame_with_hand_detection(
-                    frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats
+                prev_position, stop_detected, current_beat, last_stop_time = process_frame_with_hand_detection(
+                    frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time
                 )
 
             # 显示摄像头帧
@@ -782,6 +782,7 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         cleanup_fluidsynth()
+
 
 if __name__ == '__main__':
     main()
