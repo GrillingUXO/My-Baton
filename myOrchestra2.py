@@ -249,9 +249,8 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             cv2.putText(frame, "Rhythm Hand", (wrist_pos[0] - 50, wrist_pos[1] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 处理变化手逻辑（保持不变）
+        # 处理变化手逻辑
         if control_hand:
-            # 绘制骨骼
             mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
 
             # 获取变化手手腕点位置
@@ -272,6 +271,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                     elif distance_to_torso > 250:  # 远离躯干
                         velocity = min(127, velocity + 5)
                         print(f"变化手远离躯干，提升音量：{velocity}")
+                    with fluid_lock:
+                        fs.cc(0, 7, velocity)
+                        
                     # 更新时间戳
                     last_volume_update_time = current_time
                 else:
