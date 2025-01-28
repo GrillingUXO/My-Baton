@@ -30,6 +30,9 @@ control_hand_label = None  # 变化手的左右信息（"Left" 或 "Right"）
 
 last_distance_to_torso = None  # 记录变化手上一帧与躯干的距离
 
+beat_lock = Lock()
+playback_thread = None
+stop_playback = False
 
 
 # 在全局变量定义区添加以下变量
@@ -68,9 +71,6 @@ animation_point = None  # 停顿动画位置
 animation_start_time = None  # 停顿动画开始时间
 animation_duration = 0.5  # 停顿动画持续时间
 STOP_THRESHOLD = 50  # 停顿检测的运动幅度阈值
-
-playback_thread = None
-stop_playback = False
 
 
 last_stop_position = None
@@ -118,85 +118,78 @@ def select_midi_and_soundfont_files():
 
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
     """
-    使用 MediaPipe 检测两只手的动作并处理逻辑：
-    1. 记录第一只出现的手是左手还是右手，并绑定为节奏手。
-    2. 第二只出现的手绑定为变化手。
-    3. 节奏手：检测滚动方向，并根据移动速度和移动距离触发 MIDI 音符播放，记录触发时刻作为 last_stop_time。
-    4. 变化手：根据手势和与躯干的相对距离调节音量。
+    使用 MediaPipe 检测两只手的动作并处理逻辑，返回控制信号和状态
+    修改点：
+    - 新增返回值 play_beat_command (是否触发播放)
+    - 新增返回值 current_bpm (当前帧计算的 BPM)
+    - 解耦播放触发和 BPM 计算逻辑
     """
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
     global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, prev_time
 
-    avg_motion = 0  # 初始化 avg_motion，防止未赋值错误
-    recognized_hand_mouvement_scrolling = None  # 用于存储滚动方向的变量
-    speed_threshold = 300  # 节奏手移动速度阈值（像素/秒）
-    distance_threshold = 200  # 移动距离阈值（像素）
+    # 初始化控制信号变量
+    play_beat_command = False  # 节拍播放触发标志
+    current_bpm = bpm          # 当前计算的 BPM（默认使用全局值）
+    new_last_stop_time = last_stop_time  # 用于临时存储新时间戳
 
-    # 使用 MediaPipe Pose 检测躯干
+    avg_motion = 0
+    recognized_hand_mouvement_scrolling = None
+    speed_threshold = 300
+    distance_threshold = 200
+
+    # 躯干检测逻辑（完整保留）
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pose_result = pose.process(rgb_frame)
-
-    # 绘制躯干骨架
-    torso_center = None  # 躯干中心点（肩膀中点）
+    torso_center = None
     if pose_result.pose_landmarks:
         mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
-        
-        # 计算躯干中心（肩膀中点）
         left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
         torso_center = (
-            int((left_shoulder.x + right_shoulder.x) / 2 * frame.shape[1]),
-            int((left_shoulder.y + right_shoulder.y) / 2 * frame.shape[0]),
+            int((left_shoulder.x + right_shoulder.x)/2 * frame.shape[1]),
+            int((left_shoulder.y + right_shoulder.y)/2 * frame.shape[0])
         )
-        cv2.circle(frame, torso_center, 5, (0, 255, 0), -1)  # 绘制躯干中心点
+        cv2.circle(frame, torso_center, 5, (0,255,0), -1)
 
-    # 使用 MediaPipe Hands 检测手势
+    # 手势检测逻辑（完整保留）
     hand_result = hands.process(rgb_frame)
-
     if hand_result.multi_hand_landmarks and hand_result.multi_handedness:
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
-        # 绑定节奏手和变化手
+        # 绑定节奏手和变化手（完整逻辑）
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
-                label = handedness.classification[0].label  # "Left" 或 "Right"
-
-                if rhythm_hand_label is None:  # 第一只出现的手
+                label = handedness.classification[0].label
+                if rhythm_hand_label is None:
                     rhythm_hand_label = label
-                    print(f"节奏手绑定为：{label}")
-                elif control_hand_label is None and label != rhythm_hand_label:  # 第二只手
+                elif control_hand_label is None and label != rhythm_hand_label:
                     control_hand_label = label
-                    print(f"变化手绑定为：{label}")
 
-        # 根据绑定的左右信息获取节奏手和变化手
+        # 获取节奏手和变化手实例
         rhythm_hand = None
         control_hand = None
         for idx, handedness in enumerate(handedness_list):
-            label = handedness.classification[0].label  # "Left" 或 "Right"
+            label = handedness.classification[0].label
             if label == rhythm_hand_label:
                 rhythm_hand = hand_landmarks_list[idx]
             elif label == control_hand_label:
                 control_hand = hand_landmarks_list[idx]
 
-        # 处理节奏手逻辑
+        # 节奏手逻辑（修改触发逻辑）
         if rhythm_hand:
-            # 绘制骨骼
             mp_drawing.draw_landmarks(frame, rhythm_hand, mp_hands.HAND_CONNECTIONS)
-
-            # 获取节奏手手腕点位置
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
-            # 检测滚动方向
+            # 方向检测（完整保留）
             if prev_position is not None:
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
                 mouvement_distance = (dx**2 + dy**2)**0.5
-                mouvement_distance_threshold = 0.02 * frame.shape[0]  # 基于画面高度调整阈值
-
+                mouvement_distance_threshold = 0.02 * frame.shape[0]
+                
                 if mouvement_distance > mouvement_distance_threshold:
-                    # 计算滚动角度
                     angle = math.degrees(math.atan2(dy, dx))
                     if -45 <= angle < 45:
                         recognized_hand_mouvement_scrolling = "Scrolling right"
@@ -206,97 +199,79 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                         recognized_hand_mouvement_scrolling = "Scrolling left"
                     elif -135 <= angle < -45:
                         recognized_hand_mouvement_scrolling = "Scrolling down"
-                    print(f"节奏手滚动方向: {recognized_hand_mouvement_scrolling}")
+                    cv2.putText(frame, recognized_hand_mouvement_scrolling, 
+                               (wrist_pos[0]+20, wrist_pos[1]-20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
-                    # 在画面上显示滚动方向
-                    cv2.putText(frame, recognized_hand_mouvement_scrolling, (wrist_pos[0] + 20, wrist_pos[1] - 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-
-            # 检测移动速度和距离并播放 MIDI 音符
+            # 触发条件检测（修改点：计算 BPM 并设置播放标志）
             if prev_position is not None and prev_time is not None:
                 current_time = time.time()
                 delta_time = current_time - prev_time
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
                 distance = (dx**2 + dy**2)**0.5
-                speed = distance / delta_time  # 计算速度（像素/秒）
+                speed = distance / delta_time
 
-                # 当速度和距离均超过阈值时触发音符播放
                 if speed > speed_threshold and distance > distance_threshold:
-                    print(f"检测到速度: {speed:.2f}，移动距离: {distance:.2f}，触发 MIDI 音符播放。")
-                    
-                    # 更新 BPM
+                    # 计算新 BPM（不直接修改全局变量）
                     if last_stop_time is not None:
                         interval = current_time - last_stop_time
-                        bpm = max(60, min(200, 60 / interval))  # 限制 BPM 范围
-                        print(f"动态更新 BPM: {bpm:.2f}")
+                        current_bpm = max(60, min(200, 60 / interval))  # 写入临时变量
+                    
+                    # 设置播放命令
+                    play_beat_command = True
+                    new_last_stop_time = current_time  # 更新临时时间戳
 
-                    # 更新 last_stop_time
-                    last_stop_time = current_time
-
-                    # 播放对应节拍音符
-                    if 0 <= current_beat < total_beats:  # 确保 current_beat 在有效范围
-                        play_midi_beat_persistent(beats_notes, current_beat, bpm, volume, frame)
-                        current_beat += 1  # 更新节拍
-                prev_time = current_time  # 更新时间戳
+                prev_time = current_time
             else:
-                prev_time = time.time()  # 初始化时间戳
+                prev_time = time.time()
 
-            # 更新上一帧位置
             prev_position = wrist_pos
+            cv2.putText(frame, "Rhythm Hand", (wrist_pos[0]-50, wrist_pos[1]-20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-            # 标记节奏手
-            cv2.putText(frame, "Rhythm Hand", (wrist_pos[0] - 50, wrist_pos[1] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        # 处理变化手逻辑
+        # 变化手逻辑（完整保留）
         if control_hand:
             mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
-
-            # 获取变化手手腕点位置
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
-            control_wrist_pos = (int(control_wrist.x * frame.shape[1]), int(control_wrist.y * frame.shape[0]))
-
-            # 根据变化手和躯干的距离调整音量
+            control_wrist_pos = (int(control_wrist.x * frame.shape[1]), 
+                                int(control_wrist.y * frame.shape[0]))
+            
             if torso_center:
-                distance_to_torso = ((control_wrist_pos[0] - torso_center[0])**2 + 
-                                     (control_wrist_pos[1] - torso_center[1])**2) ** 0.5
-
+                distance_to_torso = ((control_wrist_pos[0]-torso_center[0])**2 + 
+                                    (control_wrist_pos[1]-torso_center[1])**2)**0.5
                 current_time = time.time()
                 if last_volume_update_time is None or current_time - last_volume_update_time > 0.2:
-                    # 判断距离范围，调整音量
-                    if distance_to_torso < 150:  # 靠近躯干
-                        velocity = max(0, velocity - 5)
-                        print(f"变化手靠近躯干，降低音量：{velocity}")
-                    elif distance_to_torso > 250:  # 远离躯干
-                        velocity = min(127, velocity + 5)
-                        print(f"变化手远离躯干，提升音量：{velocity}")
+                    if distance_to_torso < 150:
+                        velocity = max(0, velocity-5)
+                    elif distance_to_torso > 250:
+                        velocity = min(127, velocity+5)
                     with fluid_lock:
                         fs.cc(0, 7, velocity)
-                        
-                    # 更新时间戳
                     last_volume_update_time = current_time
-                else:
-                    print("音量维持不变。")
+                cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10,100),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            
+            cv2.putText(frame, "Control Hand", (control_wrist_pos[0]-50, control_wrist_pos[1]-20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-                # 显示手腕与躯干的实时距离
-                cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    # 显示信息（添加控制信号状态）
+    cv2.putText(frame, f"BPM: {current_bpm:.2f}", (10,30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    cv2.putText(frame, f"Play Command: {play_beat_command}", (10,200),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255), 2)
+    cv2.putText(frame, f"Velocity: {velocity}", (10,70),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
 
-            # 标记变化手
-            cv2.putText(frame, "Control Hand", (control_wrist_pos[0] - 50, control_wrist_pos[1] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-
-    # 显示运动幅度和停顿状态
-    cv2.putText(frame, f"Motion: {avg_motion:.2f}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    # 显示当前 BPM 和音量
-    if last_pause_info["bpm"] is not None:
-        cv2.putText(frame, f"BPM: {last_pause_info['bpm']:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, f"Velocity: {velocity}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-    return prev_position, stop_detected, current_beat, last_stop_time  # 返回更新后的状态
+    # 返回所有状态变量（包含新增的 play_beat_command 和 current_bpm）
+    return (
+        prev_position,
+        stop_detected,
+        current_beat,
+        new_last_stop_time if 'new_last_stop_time' in locals() else last_stop_time,
+        play_beat_command,  # 新增：节拍播放触发标志
+        current_bpm         # 新增：当前计算的 BPM
+    )
 
 
 
@@ -427,7 +402,11 @@ def cleanup_fluidsynth():
 
 
 def calculate_note_durations(bpm):
-    """Calculate durations for 16th, 8th, and 4th notes based on BPM."""
+    """
+    计算音符时值（基于 BPM）
+    改进点：
+    - 保留原始逻辑，无需修改
+    """
     beat_duration = 60 / bpm  # Duration of a quarter note (4th note)
     return {
         "16th": beat_duration / 4,
@@ -450,71 +429,52 @@ if not midi_file_path:
 
 
 
-from mido import MidiFile, MetaMessage
 
+import pretty_midi
+
+from mido import MidiFile, MidiTrack, MetaMessage, Message
 import pretty_midi
 
 def preprocess_midi(midi_file_path):
     """
-    Parse a multi-voice MIDI file to extract notes, durations, and velocities for each beat and voice.
-    Returns:
-        - all_beats_notes: A list of lists, where each sublist corresponds to a voice's beats_notes.
-        - ticks_per_beat: Number of ticks per beat (PPQN) in the MIDI file.
-        - bpm: The original BPM detected from the MIDI file.
+    解析 MIDI 文件并提取多声部音符数据
+    改进点：
+    - 保留原始时间戳（秒为单位）
+    - 支持多通道音符数据
     """
-    try:
-        midi_data = pretty_midi.PrettyMIDI(midi_file_path)
-        print(f"成功加载 MIDI 文件: {midi_file_path}")
-    except Exception as e:
-        print(f"无法加载 MIDI 文件: {e}")
-        cleanup_fluidsynth()
-        exit()
+    midi_data = pretty_midi.PrettyMIDI(midi_file_path)
+    bpm = midi_data.estimate_tempo()
 
-    # Get tempo and ticks_per_beat
-    if midi_data.get_tempo_changes()[0].size > 0:
-        tempo = midi_data.get_tempo_changes()[1][0]  # Use the first tempo
-    else:
-        tempo = 120  # Default tempo if not provided
-    bpm = tempo
-    ticks_per_beat = midi_data.resolution  # Ticks per quarter note (PPQN)
+    # 初始化多声部数据结构
+    all_voices_notes = []
 
-    # Initialize all_beats_notes: One list for each instrument/voice
-    all_beats_notes = []
-
-    # Process each instrument separately
+    # 遍历每个乐器（声部）
     for instrument in midi_data.instruments:
         if instrument.is_drum:
-            continue  # Skip drum tracks
+            continue  # 跳过鼓轨道
 
-        print(f"Processing instrument: {instrument.name if instrument.name else 'Unknown'}")
+        voice_notes = {
+            "name": instrument.name if instrument.name else "Unnamed",
+            "program": instrument.program,
+            "notes": [],
+            "original_bpm": bpm  # 使用全局解析的 BPM
+        }
 
-        # Initialize beats_notes for this instrument
-        beats_notes = []
+        # 收集原始音符数据（秒为单位）
         for note in instrument.notes:
-            # Calculate note duration in beats
-            note_duration = (note.end - note.start) * bpm / 60  # Convert seconds to beats
+            voice_notes["notes"].append({
+                "pitch": note.pitch,
+                "start_sec": note.start,     # 起始时间（秒）
+                "end_sec": note.end,         # 结束时间（秒）
+                "velocity": note.velocity,
+                "duration_sec": note.end - note.start  # 持续时间（秒）
+            })
 
-            # Determine the note value (quantized to standard divisions)
-            note_value = 4 / note_duration  # Inverse of duration in beats
+        all_voices_notes.append(voice_notes)
 
-            # Find the beat index where this note belongs
-            start_beat = int(note.start * bpm / 60)  # Convert note start time to beat index
-            while len(beats_notes) <= start_beat:
-                beats_notes.append([])  # Ensure beats_notes has enough space
+    return all_voices_notes, midi_data.resolution, bpm
 
-            # Append note to the corresponding beat
-            beats_notes[start_beat].append((note.pitch, note_value, note.velocity))
-
-        # Remove empty beats and add to all_beats_notes
-        beats_notes = [beat for beat in beats_notes if beat]
-        all_beats_notes.append(beats_notes)
-
-    print(f"MIDI 文件原曲 BPM: {bpm:.2f}")
-    print(f"预处理完成，共解析出 {len(all_beats_notes)} 个声部。")
-    return all_beats_notes, ticks_per_beat, bpm
-
-
-
+        
 
 # Select and load MIDI and SoundFont files
 midi_file_path = select_midi_and_soundfont_files()
@@ -595,54 +555,82 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
 
 import threading
 
-def play_midi_beat_persistent(beats_notes, beat_index, bpm, volume, frame):
+def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
     """
-    播放指定节拍的音符，并动态更新节拍索引。
+    动态播放 MIDI 内容（支持打断跳拍）
     """
-    global fs, playback_thread, stop_playback, fluid_lock
+    global fs, playback_thread, stop_playback, current_beat, interrupt_flag
 
-    if fs is None:
-        print("FluidSynth 未启动。")
+    if not play_beat_command or fs is None:
         return
 
-    if beat_index >= len(beats_notes[0]):  # 确保当前节拍索引不越界
-        print("所有节拍已播放完毕。")
-        return
+    # 关键修改点：无论是否在播放，直接推进节拍
+    with beat_lock:
+        current_beat += 1  # 强制进入下一拍
+        interrupt_flag = True  # 标记需要打断
 
-    # 停止当前播放线程（如果存在）
+    # 终止旧线程（若存在）
     if playback_thread and playback_thread.is_alive():
         stop_playback = True
-        playback_thread.join()
+        playback_thread.join(timeout=0.01)  # 快速终止
 
-    # 播放音符的函数
     def play_notes():
-        global stop_playback
+        global stop_playback, interrupt_flag
         stop_playback = False
+        interrupt_flag = False  # 重置打断标志
 
-        for voice_notes in beats_notes:
-            if beat_index < len(voice_notes):  # 确保有对应节拍内容
-                for note, note_value, velocity in voice_notes[beat_index]:
-                    if stop_playback:  # 检查是否需要中断播放
-                        print("Playback interrupted.")
-                        return
+        # 锁定目标节拍（使用最新的 current_beat 前需回退1拍）
+        with beat_lock:
+            target_beat = current_beat - 1  # 因为 current_beat 已被提前递增
+            beat_duration = 60.0 / current_bpm
+            start_time = target_beat * beat_duration
+            end_time = (target_beat + 1) * beat_duration
 
-                    # 调整音符音量和时值
-                    adjusted_velocity = int(velocity * (volume / 127.0))
-                    adjusted_velocity = max(0, min(127, adjusted_velocity))
-                    playback_duration = (60 / bpm) * (4 / note_value)
+        # 收集事件（严格匹配时间窗口）
+        events = []
+        for voice in all_voices_notes:
+            for note in voice["notes"]:
+                if start_time <= note["start_sec"] < end_time:
+                    events.append({
+                        "type": "note_on",
+                        "time": note["start_sec"],
+                        "pitch": note["pitch"],
+                        "velocity": int(note["velocity"] * (volume / 127.0)),
+                        "channel": voice["program"]
+                    })
+                    events.append({
+                        "type": "note_off",
+                        "time": note["end_sec"],
+                        "pitch": note["pitch"],
+                        "channel": voice["program"]
+                    })
 
-                    with fluid_lock:
-                        fs.noteon(0, note, adjusted_velocity)
-                        time.sleep(playback_duration)
-                        fs.noteoff(0, note)
+        events.sort(key=lambda x: x["time"])
 
-                    print(f"Played note {note} with value {note_value:.2f}, velocity {adjusted_velocity}, duration {playback_duration:.2f}s.")
+        # 高精度播放控制
+        playback_start_time = time.perf_counter()
+        for event in events:
+            if stop_playback or interrupt_flag:  # 被打断时立即退出
+                return
 
-    # 启动新线程播放音符
+            event_time = event["time"] - start_time
+            while (time.perf_counter() - playback_start_time) < event_time:
+                if stop_playback or interrupt_flag:
+                    return
+                time.sleep(0.0001)  # 100μs精度
+
+            # 执行音符事件
+            with fluid_lock:
+                if event["type"] == "note_on":
+                    fs.noteon(event["channel"], event["pitch"], event["velocity"])
+                else:
+                    fs.noteoff(event["channel"], event["pitch"])
+
+    # 启动新线程（总是播放最新节拍）
     playback_thread = threading.Thread(target=play_notes)
     playback_thread.start()
-
-
+    
+    
 
 def main():
     # 初始化摄像头
@@ -654,9 +642,8 @@ def main():
 
     print("按 'q' 键退出程序。")
 
-    note_durations = None
     beats_notes, ticks_per_beat, bpm = preprocess_midi(midi_file_path)
-    total_beats = len(beats_notes[0]) if beats_notes else 0  # 确保存在有效的节拍数据
+    total_beats = len(beats_notes) if beats_notes else 0  # 确保存在有效的节拍数据
 
     # 使用 MIDI 文件原曲 BPM 初始化
     bpm = None  # 初始化 BPM 为 None，确保我们明确地从 MIDI 获取
@@ -697,9 +684,12 @@ def main():
             frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
 
             # MIDI 播放流程
-            prev_position, stop_detected, current_beat, last_stop_time = process_frame_with_hand_detection(
+            prev_position, stop_detected, current_beat, last_stop_time, play_beat_command, current_bpm = process_frame_with_hand_detection(
                 frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time
             )
+
+            # 动态播放 MIDI 音符
+            play_midi_beat_persistent(beats_notes, play_beat_command, current_bpm, volume, frame)
 
             # 显示摄像头帧
             cv2.imshow("Hand Gesture MIDI Control", frame)
@@ -714,7 +704,7 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         cleanup_fluidsynth()
-
+        
 
 if __name__ == '__main__':
     main()
