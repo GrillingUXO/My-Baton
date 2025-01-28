@@ -203,7 +203,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                                (wrist_pos[0]+20, wrist_pos[1]-20),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
-            # 触发条件检测（修改点：计算 BPM 并设置播放标志）
+            # 触发条件检测
             if prev_position is not None and prev_time is not None:
                 current_time = time.time()
                 delta_time = current_time - prev_time
@@ -213,7 +213,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 speed = distance / delta_time
 
                 if speed > speed_threshold and distance > distance_threshold:
-                    # 计算新 BPM（不直接修改全局变量）
+                    # 计算新 BPM
                     if last_stop_time is not None:
                         interval = current_time - last_stop_time
                         current_bpm = max(60, min(200, 60 / interval))  # 写入临时变量
@@ -230,7 +230,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             cv2.putText(frame, "Rhythm Hand", (wrist_pos[0]-50, wrist_pos[1]-20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-        # 变化手逻辑（完整保留）
+        # 变化手逻辑
         if control_hand:
             mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
@@ -255,7 +255,6 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             cv2.putText(frame, "Control Hand", (control_wrist_pos[0]-50, control_wrist_pos[1]-20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-    # 显示信息（添加控制信号状态）
     cv2.putText(frame, f"BPM: {current_bpm:.2f}", (10,30), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
     cv2.putText(frame, f"Play Command: {play_beat_command}", (10,200),
@@ -263,29 +262,14 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     cv2.putText(frame, f"Velocity: {velocity}", (10,70),
                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
 
-    # 返回所有状态变量（包含新增的 play_beat_command 和 current_bpm）
     return (
         prev_position,
         stop_detected,
         current_beat,
         new_last_stop_time if 'new_last_stop_time' in locals() else last_stop_time,
-        play_beat_command,  # 新增：节拍播放触发标志
-        current_bpm         # 新增：当前计算的 BPM
+        play_beat_command, 
+        current_bpm       
     )
-
-
-
-
-def calculate_angle(vec1, vec2):
-    """计算两向量之间的夹角（单位：度）"""
-    dot_product = vec1[0] * vec2[0] + vec1[1] * vec2[1]
-    magnitude1 = (vec1[0]**2 + vec1[1]**2)**0.5
-    magnitude2 = (vec2[0]**2 + vec2[1]**2)**0.5
-    if magnitude1 == 0 or magnitude2 == 0:
-        return 0  # 防止除以零
-    cos_theta = dot_product / (magnitude1 * magnitude2)
-    cos_theta = max(-1, min(1, cos_theta))  # 防止浮点误差导致超出范围
-    return math.degrees(math.acos(cos_theta))
 
 
 
