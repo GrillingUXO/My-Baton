@@ -17,6 +17,16 @@ class ProgramState(Enum):
     EXITING = 3
 
 
+# 新增全局变量区
+current_beat = 0                 # 当前播放的拍子序号
+beat_lock = threading.Lock()     # 节拍计数器锁
+
+
+global_active_notes = {}  # 格式: {(channel, pitch): {"end_sec": float, "velocity": int}}
+global_notes_lock = threading.Lock()
+
+
+
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
@@ -229,6 +239,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             prev_position = wrist_pos
             cv2.putText(frame, "Rhythm Hand", (wrist_pos[0]-50, wrist_pos[1]-20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            
 
         # 变化手逻辑
         if control_hand:
@@ -344,34 +355,28 @@ def centroid(max_contour):
 
 
 def start_fluidsynth():
-    """Initialize the FluidSynth instance and load the SoundFont."""
-    global fs, soundfont_path, sfid  # 新增sfid全局变量
+    global fs, soundfont_path, sfid
 
     if fs is not None:
-        print("FluidSynth 已经初始化。")
         return
-
-    if not soundfont_path:
-        print("SoundFont 文件路径未定义。")
-        cleanup_fluidsynth()
-        exit()
 
     try:
         fs = fluidsynth.Synth()
-        fs.start(driver="coreaudio")  # 其他平台使用对应驱动
-        sfid = fs.sfload(soundfont_path)  # 存储SoundFont ID
+        fs.start(driver="coreaudio")  # Windows 用 "dsound", Linux 用 "alsa"
+
         
-        # 初始化所有16个MIDI通道
+        # 加载 SoundFont
+        sfid = fs.sfload(soundfont_path)
+        
+        # 初始化所有通道
         with fluid_lock:
             for channel in range(16):
-                # 默认使用bank 0, program 0
                 fs.program_select(channel, sfid, 0, 0)
-        print(f"FluidSynth 初始化完成，SoundFont ID: {sfid}")
+        print(f"FluidSynth 初始化完成 | 复音数: 1024")
     except Exception as e:
         print(f"初始化 FluidSynth 时出错: {e}")
         cleanup_fluidsynth()
         exit()
-        
 
 
 def cleanup_fluidsynth():
@@ -425,64 +430,78 @@ from mido import MidiFile, MidiTrack, MetaMessage, Message
 import pretty_midi
 
 
+current_playback_position = 0.0  # 当前播放位置（秒）
+is_auto_playing = False
+playback_events = []  # 预处理的全局播放事件列表
 
 def preprocess_midi(midi_file_path):
     """
     解析 MIDI 文件并提取多声部音符数据
+    返回值：beats_notes, ticks_per_beat, bpm
     """
     global sfid  # 访问全局SoundFont ID
-    
-    midi_data = pretty_midi.PrettyMIDI(midi_file_path)
-    bpm = midi_data.estimate_tempo()
 
-    # 初始化多声部数据结构
-    all_voices_notes = []
+    try:
+        # 使用 pretty_midi 解析 MIDI 文件
+        midi_data = pretty_midi.PrettyMIDI(midi_file_path)
+        bpm = midi_data.estimate_tempo()  # 获取估计的 BPM
+        ticks_per_beat = midi_data.resolution  # 获取每拍的 ticks 数
 
-    # 遍历每个乐器（声部）
-    for instrument in midi_data.instruments:
-        if instrument.is_drum:
-            continue  # 跳过鼓轨道
+        # 初始化多声部数据结构
+        all_voices_notes = []
 
-        # 动态设置通道音色
-        channel = instrument.program % 16  # 确保通道号在0-15范围内
-        target_program = instrument.program % 128  # 规范Program范围(0-127)
-        
-        with fluid_lock:
-            try:
-                # 关键修复：使用正确的sfid参数，添加bank自动探测
-                # 尝试默认bank 0
-                fs.program_select(channel, sfid, 0, target_program)
-                print(f"通道{channel} 设置成功: Bank 0, Program {target_program}")
-            except fluidsynth.FluidError:
+        # 遍历每个乐器（声部）
+        for instrument in midi_data.instruments:
+            if instrument.is_drum:
+                continue  # 跳过鼓轨道
+
+            # 动态设置通道音色
+            channel = instrument.program % 16  # 确保通道号在0-15范围内
+            target_program = instrument.program % 128  # 规范Program范围(0-127)
+            
+            with fluid_lock:
                 try:
-                    # 尝试通用bank 128
-                    fs.program_select(channel, sfid, 128, target_program)
-                    print(f"通道{channel} 使用Bank 128, Program {target_program}")
+                    # 关键修复：使用正确的sfid参数，添加bank自动探测
+                    # 尝试默认bank 0
+                    fs.program_select(channel, sfid, 0, target_program)
+                    print(f"通道{channel} 设置成功: Bank 0, Program {target_program}")
                 except fluidsynth.FluidError:
-                    # 回退到默认钢琴音色
-                    fs.program_select(channel, sfid, 0, 0)
-                    print(f"通道{channel} 音色不可用，已回退到钢琴")
+                    try:
+                        # 尝试通用bank 128
+                        fs.program_select(channel, sfid, 128, target_program)
+                        print(f"通道{channel} 使用Bank 128, Program {target_program}")
+                    except fluidsynth.FluidError:
+                        # 回退到默认钢琴音色
+                        fs.program_select(channel, sfid, 0, 0)
+                        print(f"通道{channel} 音色不可用，已回退到钢琴")
 
-        voice_notes = {
-            "name": instrument.name if instrument.name else "Unnamed",
-            "program": channel,
-            "notes": [],
-            "original_bpm": bpm
-        }
+            voice_notes = {
+                "name": instrument.name if instrument.name else "Unnamed",
+                "program": channel,
+                "notes": [],
+                "original_bpm": bpm
+            }
 
-        # 收集原始音符数据（秒为单位）
-        for note in instrument.notes:
-            voice_notes["notes"].append({
-                "pitch": note.pitch,
-                "start_sec": note.start,
-                "end_sec": note.end,
-                "velocity": note.velocity,
-                "duration_sec": note.end - note.start
-            })
+            # 收集原始音符数据（秒为单位）
+            for note in instrument.notes:
+                voice_notes["notes"].append({
+                    "pitch": note.pitch,
+                    "start_sec": note.start,
+                    "end_sec": note.end,
+                    "velocity": note.velocity,
+                    "duration_sec": note.end - note.start
+                })
 
-        all_voices_notes.append(voice_notes)
+            all_voices_notes.append(voice_notes)
 
-    return all_voices_notes, midi_data.resolution, bpm
+        return all_voices_notes, ticks_per_beat, bpm
+
+    except Exception as e:
+        print(f"解析 MIDI 文件时出错: {e}")
+        cleanup_fluidsynth()
+        exit()
+        
+
 
 
 # Select and load MIDI and SoundFont files
@@ -564,120 +583,173 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
 
 import threading
 
+
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
     """
-    动态播放 MIDI 内容（支持打断跳拍）
+    改进的 MIDI 播放逻辑：
+    1. 允许长音跨拍播放，不会被截断。
+    2. 确保 `global_active_notes` 中的音符在下个拍子继续触发 `note_on`。
+    3. 仅在真正需要时发送 `note_off`，避免音符被提前切断。
     """
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
+    global global_active_notes, global_notes_lock
 
     if not play_beat_command or fs is None:
         return
 
-    # 关键修复1：在创建新线程前强制终止所有音符
     def panic_all_notes():
+        """清除所有音符，避免残留声音。"""
         with fluid_lock:
             for channel in range(16):
-                for note in range(127):
-                    fs.noteoff(channel, note)
+                fs.cc(channel, 123, 0)  # 123 = All Notes Off
+                fs.cc(channel, 121, 0)  # 121 = Reset All Controllers
+        with global_notes_lock:
+            global_active_notes.clear()
 
-    # 关键修复2：改进线程终止机制
     if playback_thread and playback_thread.is_alive():
         stop_playback = True
-        playback_thread.join(timeout=0.1)
-        panic_all_notes()  # 确保所有音符静音
+        try:
+            playback_thread.join(timeout=0.05)
+        except RuntimeError:
+            pass
+        finally:
+            panic_all_notes()
 
-    # 关键修复3：重置播放状态
+    # 计算当前节拍时间范围
     with beat_lock:
         current_beat += 1
         interrupt_flag = True
+        beat_duration = 60.0 / max(20, min(current_bpm, 300))  # 限制 BPM 范围
+        start_time = (current_beat - 1) * beat_duration
+        end_time = current_beat * beat_duration
 
     def play_notes():
-        global stop_playback, interrupt_flag
+        global stop_playback, interrupt_flag, global_active_notes
         stop_playback = False
         interrupt_flag = False
-
-        # 获取目标节拍范围
-        with beat_lock:
-            target_beat = current_beat - 1
-            beat_duration = 60.0 / current_bpm
-            start_time = target_beat * beat_duration
-            end_time = (target_beat + 1) * beat_duration
-
-        # 收集事件并添加自动note_off保护
         events = []
-        active_notes = {}  # 跟踪活动音符 (channel, pitch)
-        
-        for voice in all_voices_notes:
-            for note in voice["notes"]:
-                if start_time <= note["start_sec"] < end_time:
-                    note_on = {
-                        "type": "note_on",
-                        "time": note["start_sec"],
-                        "pitch": note["pitch"],
-                        "velocity": int(note["velocity"] * (volume / 127.0)),
-                        "channel": voice["program"]
-                    }
-                    note_off = {
-                        "type": "note_off",
-                        "time": note["end_sec"],
-                        "pitch": note["pitch"],
-                        "channel": voice["program"]
-                    }
-                    events.extend([note_on, note_off])
-                    active_notes[(voice["program"], note["pitch"])] = note_off
 
-        # 添加保护性note_off事件（防止中断导致音符残留）
-        events.append({
-            "type": "panic_off",
-            "time": end_time + 0.1  # 在节拍结束后强制关闭
-        })
+        try:
+            carry_over_notes = {}
+            with global_notes_lock:
+                # **确保跨拍音符继续播放**
+                for (ch, pitch), note_info in list(global_active_notes.items()):
+                    note_info["remaining_beats"] -= 1
+                    if note_info["remaining_beats"] > 0:
+                        carry_over_notes[(ch, pitch)] = note_info
+                        # **重新触发 `note_on` 以继续播放**
+                        events.append({
+                            "type": "note_on",
+                            "time": start_time,
+                            "pitch": pitch,
+                            "velocity": note_info["velocity"],
+                            "channel": ch
+                        })
+                    else:
+                        # 只有真正结束的音符才触发 `note_off`
+                        events.append({
+                            "type": "note_off",
+                            "time": end_time,
+                            "pitch": pitch,
+                            "channel": ch
+                        })
 
-        events.sort(key=lambda x: x["time"])
+                global_active_notes = carry_over_notes.copy()
 
-        playback_start_time = time.perf_counter()
-        last_processed_time = 0.0
+            # 处理新进入的音符
+            new_notes = {}
+            for voice in all_voices_notes:
+                program = voice["program"]
+                for note in voice["notes"]:
+                    note_start = note["start_sec"]
+                    note_end = note["end_sec"]
 
-        for event in events:
-            if stop_playback or interrupt_flag:
-                break
+                    if note_end <= note_start:
+                        continue
 
-            # 计算精确等待时间
-            event_time = event["time"] - start_time
-            while True:
-                elapsed = time.perf_counter() - playback_start_time
-                if elapsed >= event_time:
-                    break
+                    note_duration_beats = (note_end - note_start) / beat_duration
+
+                    if start_time <= note_start < end_time:
+                        events.append({
+                            "type": "note_on",
+                            "time": note_start,
+                            "pitch": note["pitch"],
+                            "velocity": int(note["velocity"] * (volume / 127.0)),
+                            "channel": program
+                        })
+
+                        if note_duration_beats > 1:
+                            new_notes[(program, note["pitch"])] = {
+                                "remaining_beats": note_duration_beats - 1,
+                                "velocity": int(note["velocity"] * (volume / 127.0))
+                            }
+                        else:
+                            events.append({
+                                "type": "note_off",
+                                "time": note_end,
+                                "pitch": note["pitch"],
+                                "channel": program
+                            })
+
+            # **更新全局状态，确保音符不会被丢失**
+            with global_notes_lock:
+                global_active_notes.update(new_notes)
+
+            # 事件排序
+            events.sort(key=lambda x: x["time"])
+            playback_start = time.perf_counter()
+
+            # 播放 MIDI 事件
+            for event in events:
                 if stop_playback or interrupt_flag:
                     break
-                time.sleep(max(0, (event_time - elapsed) * 0.9))  # 动态调整等待精度
 
-            if stop_playback or interrupt_flag:
-                break
+                event_offset = event["time"] - start_time
+                while (time.perf_counter() - playback_start) < event_offset:
+                    if stop_playback or interrupt_flag:
+                        break
+                    time.sleep(0.0005)
 
+                with fluid_lock:
+                    try:
+                        if event["type"] == "note_on":
+                            fs.noteon(event["channel"], event["pitch"], event["velocity"])
+                        else:
+                            fs.noteoff(event["channel"], event["pitch"])
+                    except fluidsynth.FluidError as e:
+                        if "noteon" in str(e):
+                            current_poly = fs.get_setting("synth.polyphony")
+                            new_poly = min(current_poly * 2, 4096)
+                            fs.set_setting("synth.polyphony", str(new_poly))
+                            print(f"动态调整复音数: {current_poly} -> {new_poly}")
+                            fs.noteon(event["channel"], event["pitch"], event["velocity"])
+
+            # 清理未正确释放的音符
+            residual_clean = []
             with fluid_lock:
-                if event["type"] == "note_on":
-                    fs.noteon(event["channel"], event["pitch"], event["velocity"])
-                elif event["type"] == "note_off":
-                    fs.noteoff(event["channel"], event["pitch"])
-                    if (event["channel"], event["pitch"]) in active_notes:
-                        del active_notes[(event["channel"], event["pitch"])]
-                elif event["type"] == "panic_off":
-                    # 强制关闭所有残留音符
-                    for (ch, pitch), _ in active_notes.items():
+                for event in events:
+                    if event["type"] == "note_on" and not any(
+                        e["type"] == "note_off" and 
+                        e["channel"] == event["channel"] and 
+                        e["pitch"] == event["pitch"]
+                        for e in events
+                    ):
+                        residual_clean.append((event["channel"], event["pitch"]))
+
+            if residual_clean:
+                with fluid_lock:
+                    for ch, pitch in residual_clean:
                         fs.noteoff(ch, pitch)
-                    active_notes.clear()
 
-        # 最终清理
-        with fluid_lock:
-            for (ch, pitch) in list(active_notes.keys()):
-                fs.noteoff(ch, pitch)
+        finally:
+            panic_all_notes()
 
-    playback_thread = threading.Thread(target=play_notes)
+    # 启动线程
+    playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
 
-    
-    
 
+    
 def main():
     # 初始化摄像头
     cap = cv2.VideoCapture(0)
@@ -754,3 +826,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
