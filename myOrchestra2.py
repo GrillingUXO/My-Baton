@@ -289,35 +289,54 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     
 def handle_auto_play_control(hand_result, all_voices_notes, current_bpm, volume):
     """
-    改进的自动播放控制函数
+    改进的自动播放控制函数：
+    - 仅根据节奏手（rhythm_hand_label）切换模式，变化手不影响切换逻辑。
+    - 节奏手消失 1 秒后才切换到自动播放。
+    - 节奏手出现 1 秒后才切换到手动模式。
+    - 避免检测到变化手导致错误触发切换（播放 1 秒，停 1 秒问题）。
     """
-    global is_auto_playing, last_rhythm_hand_time
-    
-    # 添加 BPM 有效性检查
+    global is_auto_playing, last_rhythm_hand_time, stop_playback
+
+    # 确保 BPM 合法
     if current_bpm is None or current_bpm <= 0:
         current_bpm = 120  # 设置安全默认值
-    
-    # 检测节奏手存在性
+
+    current_time = time.time()
     rhythm_detected = False
+
+    # 检测是否找到 **节奏手**
     if hand_result.multi_hand_landmarks:
-        for handedness in hand_result.multi_handedness:
-            if handedness.classification[0].label == rhythm_hand_label:
+        for i, handedness in enumerate(hand_result.multi_handedness):
+            label = handedness.classification[0].label
+            if label == rhythm_hand_label:  # 确保只用节奏手更新状态
                 rhythm_detected = True
-                last_rhythm_hand_time = time.time()
-                break
-    
-    # 状态管理
+                if last_rhythm_hand_time is None:
+                    last_rhythm_hand_time = current_time  # 记录节奏手首次出现的时间
+                break  # **跳出循环，避免误判**
+
+    # **避免错误地更新 last_rhythm_hand_time**
+    if not rhythm_detected:
+        if last_rhythm_hand_time is None:  # 只有第一次未检测到时才初始化
+            last_rhythm_hand_time = current_time
+
+    # **模式切换逻辑**
     if rhythm_detected:
-        if is_auto_playing:
+        # **节奏手稳定出现超过 1 秒，切换到手动模式**
+        if is_auto_playing and (current_time - last_rhythm_hand_time >= 1.0):
             print("切回手动模式，保留播放位置")
             is_auto_playing = False
-            stop_playback = True
+            stop_playback = True  # 立即停止自动播放
     else:
-        if time.time() - (last_rhythm_hand_time or 0) > AUTO_PLAY_TIMEOUT:
-            if not is_auto_playing:
-                print("开始自动播放")
-                is_auto_playing = True
-                start_full_midi_playback(all_voices_notes, current_bpm, volume)
+        # **节奏手消失超过 1 秒，切换到自动播放**
+        if not is_auto_playing and (current_time - last_rhythm_hand_time >= 1.0):
+            print("节奏手消失超过 1 秒，进入自动播放模式")
+            is_auto_playing = True
+            start_full_midi_playback(all_voices_notes, current_bpm, volume)
+
+    # **只有在检测到节奏手时才更新 last_rhythm_hand_time**
+    if rhythm_detected:
+        last_rhythm_hand_time = current_time
+
 
                 
 
@@ -713,7 +732,10 @@ import threading
 
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
     """
-    动态播放 MIDI 内容（支持跨拍长音，增强复音处理）
+    改进的 MIDI 播放逻辑：
+    1. 允许长音跨拍播放，而不会被截断。
+    2. 确保 `global_active_notes` 中的音符在下个拍子继续触发 `note_on`。
+    3. 仅在真正需要时发送 `note_off`，避免音符被提前切断。
     """
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
     global global_active_notes, global_notes_lock
@@ -721,31 +743,29 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     if not play_beat_command or fs is None:
         return
 
-    # 增强的终止函数（使用MIDI标准控制消息）
     def panic_all_notes():
+        """清除所有音符，避免残留声音。"""
         with fluid_lock:
-            # 使用All Notes Off控制消息替代暴力遍历
             for channel in range(16):
                 fs.cc(channel, 123, 0)  # 123 = All Notes Off
                 fs.cc(channel, 121, 0)  # 121 = Reset All Controllers
         with global_notes_lock:
             global_active_notes.clear()
 
-    # 线程终止逻辑优化
     if playback_thread and playback_thread.is_alive():
         stop_playback = True
         try:
-            playback_thread.join(timeout=0.05)  # 缩短超时时间
+            playback_thread.join(timeout=0.05)
         except RuntimeError:
             pass
         finally:
             panic_all_notes()
 
-    # 节拍计算与同步优化
+    # 计算当前节拍时间范围
     with beat_lock:
         current_beat += 1
         interrupt_flag = True
-        beat_duration = 60.0 / max(20, min(current_bpm, 300))  # BPM安全范围
+        beat_duration = 60.0 / max(20, min(current_bpm, 300))  # 限制 BPM 范围
         start_time = (current_beat - 1) * beat_duration
         end_time = current_beat * beat_duration
 
@@ -756,37 +776,45 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
         events = []
 
         try:
-            # 阶段1：处理跨拍音符（添加时间容差）
             carry_over_notes = {}
             with global_notes_lock:
+                # **确保跨拍音符继续播放**
                 for (ch, pitch), note_info in list(global_active_notes.items()):
                     note_info["remaining_beats"] -= 1
-                    if note_info["remaining_beats"] > 0.1:  # 添加容差防止浮点误差
+                    if note_info["remaining_beats"] > 0:
                         carry_over_notes[(ch, pitch)] = note_info
+                        # **确保音符继续播放**
+                        events.append({
+                            "type": "note_on",
+                            "time": start_time,
+                            "pitch": pitch,
+                            "velocity": note_info["velocity"],
+                            "channel": ch
+                        })
                     else:
+                        # 只有真正结束的音符才触发 note_off
                         events.append({
                             "type": "note_off",
                             "time": end_time,
                             "pitch": pitch,
                             "channel": ch
                         })
+
                 global_active_notes = carry_over_notes.copy()
 
-            # 阶段2：收集本拍新音符（添加时间范围验证）
+            # 处理新进入的音符
             new_notes = {}
             for voice in all_voices_notes:
                 program = voice["program"]
                 for note in voice["notes"]:
                     note_start = note["start_sec"]
                     note_end = note["end_sec"]
-                    
-                    # 时间范围验证（防止负值）
+
                     if note_end <= note_start:
                         continue
-                    
-                    # 精确计算节拍持续时间
+
                     note_duration_beats = (note_end - note_start) / beat_duration
-                    
+
                     if start_time <= note_start < end_time:
                         events.append({
                             "type": "note_on",
@@ -795,8 +823,8 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                             "velocity": int(note["velocity"] * (volume / 127.0)),
                             "channel": program
                         })
-                        
-                        if note_duration_beats > 1.05:  # 增加5%容差
+
+                        if note_duration_beats > 1:
                             new_notes[(program, note["pitch"])] = {
                                 "remaining_beats": note_duration_beats - 1,
                                 "velocity": int(note["velocity"] * (volume / 127.0))
@@ -809,26 +837,25 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                                 "channel": program
                             })
 
-            # 阶段3：合并音符（添加线程安全保护）
+            # **更新全局状态，确保音符不会被丢失**
             with global_notes_lock:
                 global_active_notes.update(new_notes)
 
-            # 事件排序和时间标准化
+            # 事件排序
             events.sort(key=lambda x: x["time"])
             playback_start = time.perf_counter()
-            
-            # 精确事件调度（带超时检测）
+
+            # 播放 MIDI 事件
             for event in events:
                 if stop_playback or interrupt_flag:
                     break
-                
-                # 计算相对时间
+
                 event_offset = event["time"] - start_time
                 while (time.perf_counter() - playback_start) < event_offset:
                     if stop_playback or interrupt_flag:
                         break
-                    time.sleep(0.0005)  # 提高时序精度到0.5ms
-                
+                    time.sleep(0.0005)
+
                 with fluid_lock:
                     try:
                         if event["type"] == "note_on":
@@ -837,14 +864,13 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                             fs.noteoff(event["channel"], event["pitch"])
                     except fluidsynth.FluidError as e:
                         if "noteon" in str(e):
-                            # 动态调整复音数
                             current_poly = fs.get_setting("synth.polyphony")
                             new_poly = min(current_poly * 2, 4096)
                             fs.set_setting("synth.polyphony", str(new_poly))
                             print(f"动态调整复音数: {current_poly} -> {new_poly}")
                             fs.noteon(event["channel"], event["pitch"], event["velocity"])
 
-            # 最终清理（添加残余音符检测）
+            # 清理未正确释放的音符
             residual_clean = []
             with fluid_lock:
                 for event in events:
@@ -855,19 +881,19 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                         for e in events
                     ):
                         residual_clean.append((event["channel"], event["pitch"]))
-            
+
             if residual_clean:
                 with fluid_lock:
                     for ch, pitch in residual_clean:
                         fs.noteoff(ch, pitch)
 
         finally:
-            # 确保所有音符释放
             panic_all_notes()
 
-    # 启动线程（添加线程优先级设置）
+    # 启动线程
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
+
 
     
 
