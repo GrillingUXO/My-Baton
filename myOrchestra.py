@@ -10,6 +10,9 @@ from threading import Lock
 import mediapipe as mp
 from enum import Enum
 import math
+from queue import Queue
+midi_queue = Queue()
+
 
 class ProgramState(Enum):
     INITIALIZING_BPM = 1
@@ -20,6 +23,7 @@ class ProgramState(Enum):
 # 新增全局变量区
 current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
+
 
 
 global_active_notes = {}  # 格式: {(channel, pitch): {"end_sec": float, "velocity": int}}
@@ -362,8 +366,7 @@ def start_fluidsynth():
 
     try:
         fs = fluidsynth.Synth()
-        fs.start(driver="coreaudio")  # Windows 用 "dsound", Linux 用 "alsa"
-
+        fs.start(driver="coreaudio")
         
         # 加载 SoundFont
         sfid = fs.sfload(soundfont_path)
@@ -372,11 +375,12 @@ def start_fluidsynth():
         with fluid_lock:
             for channel in range(16):
                 fs.program_select(channel, sfid, 0, 0)
-        print(f"FluidSynth 初始化完成 | 复音数: 1024")
+        print(f"FluidSynth 初始化完成 | 复音数: 256")
     except Exception as e:
         print(f"初始化 FluidSynth 时出错: {e}")
         cleanup_fluidsynth()
         exit()
+
 
 
 def cleanup_fluidsynth():
@@ -580,6 +584,27 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
 
 
 
+def midi_event_processor():
+    """
+    独立线程异步执行 MIDI 事件。
+    从全局队列 midi_queue 中取出事件并按顺序调用 fs.noteon/noteoff。
+    """
+    global fs, stop_playback, fluid_lock
+    while True:
+        event = midi_queue.get()  # 阻塞等待事件
+        # 根据需要可以在此处增加延时调度逻辑
+        with fluid_lock:
+            try:
+                if event["type"] == "note_on":
+                    fs.noteon(event["channel"], event["pitch"], event["velocity"])
+                elif event["type"] == "note_off":
+                    fs.noteoff(event["channel"], event["pitch"])
+            except fluidsynth.FluidError as e:
+                print(f"FluidSynth Error in midi_event_processor: {e}")
+        midi_queue.task_done()
+
+
+
 
 import threading
 
@@ -592,7 +617,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     3. 仅在真正需要时发送 `note_off`，避免音符被提前切断。
     """
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
-    global global_active_notes, global_notes_lock
+    global global_active_notes, global_notes_lock, midi_queue
 
     if not play_beat_command or fs is None:
         return
@@ -624,7 +649,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
         end_time = current_beat * beat_duration
 
     def play_notes():
-        global stop_playback, interrupt_flag, global_active_notes
+        global stop_playback, interrupt_flag, global_active_notes, midi_queue
         stop_playback = False
         interrupt_flag = False
         events = []
@@ -699,7 +724,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
             events.sort(key=lambda x: x["time"])
             playback_start = time.perf_counter()
 
-            # 播放 MIDI 事件
+            # 播放 MIDI 事件：异步将事件放入队列，由独立线程处理
             for event in events:
                 if stop_playback or interrupt_flag:
                     break
@@ -710,19 +735,8 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                         break
                     time.sleep(0.0005)
 
-                with fluid_lock:
-                    try:
-                        if event["type"] == "note_on":
-                            fs.noteon(event["channel"], event["pitch"], event["velocity"])
-                        else:
-                            fs.noteoff(event["channel"], event["pitch"])
-                    except fluidsynth.FluidError as e:
-                        if "noteon" in str(e):
-                            current_poly = fs.get_setting("synth.polyphony")
-                            new_poly = min(current_poly * 2, 4096)
-                            fs.set_setting("synth.polyphony", str(new_poly))
-                            print(f"动态调整复音数: {current_poly} -> {new_poly}")
-                            fs.noteon(event["channel"], event["pitch"], event["velocity"])
+                # 异步处理：将事件放入全局队列
+                midi_queue.put(event)
 
             # 清理未正确释放的音符
             residual_clean = []
@@ -739,7 +753,12 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
             if residual_clean:
                 with fluid_lock:
                     for ch, pitch in residual_clean:
-                        fs.noteoff(ch, pitch)
+                        midi_queue.put({
+                            "type": "note_off",
+                            "time": end_time,
+                            "pitch": pitch,
+                            "channel": ch
+                        })
 
         finally:
             panic_all_notes()
@@ -747,6 +766,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     # 启动线程
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
+
 
 
     
@@ -791,6 +811,10 @@ def main():
     current_beat = 0
     last_stop_time = None  # 初始化 last_stop_time
 
+    # 启动 MIDI 事件处理线程
+    midi_thread = threading.Thread(target=midi_event_processor, daemon=True)
+    midi_thread.start()
+
     try:
         while True:
             # 读取摄像头帧
@@ -822,7 +846,7 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
         cleanup_fluidsynth()
-        
+
 
 if __name__ == '__main__':
     main()
