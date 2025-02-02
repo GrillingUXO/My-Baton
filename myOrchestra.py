@@ -23,7 +23,7 @@ class ProgramState(Enum):
 # 新增全局变量区
 current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
-
+global_time_signature = (4, 4)
 
 
 global_active_notes = {}  # 格式: {(channel, pitch): {"end_sec": float, "velocity": int}}
@@ -410,18 +410,17 @@ def cleanup_fluidsynth():
 
 
 
-def calculate_note_durations(bpm):
-    """
-    计算音符时值（基于 BPM）
-    改进点：
-    - 保留原始逻辑，无需修改
-    """
-    beat_duration = 60 / bpm  # Duration of a quarter note (4th note)
+def calculate_note_durations(bpm, time_signature=global_time_signature):
+
+    # 取拍号分母
+    numerator, denominator = time_signature
+    beat_duration = (60 / bpm) * (4 / denominator)
     return {
         "16th": beat_duration / 4,
         "8th": beat_duration / 2,
         "4th": beat_duration,
     }
+
 
 
 
@@ -449,12 +448,15 @@ current_playback_position = 0.0  # 当前播放位置（秒）
 is_auto_playing = False
 playback_events = []  # 预处理的全局播放事件列表
 
+
 def preprocess_midi(midi_file_path):
     """
-    解析 MIDI 文件并提取多声部音符数据
-    返回值：beats_notes, ticks_per_beat, bpm
+    解析 MIDI 文件并提取多声部音符数据  
+    返回值：all_voices_notes, ticks_per_beat, bpm  
+    同时提取拍号信息，保存到全局变量 global_time_signature  
+    为每个声部新增 'next_note_index' 用于记录下一次要播放的音符索引。
     """
-    global sfid  # 访问全局SoundFont ID
+    global sfid, global_time_signature
 
     try:
         # 使用 pretty_midi 解析 MIDI 文件
@@ -462,7 +464,14 @@ def preprocess_midi(midi_file_path):
         bpm = midi_data.estimate_tempo()  # 获取估计的 BPM
         ticks_per_beat = midi_data.resolution  # 获取每拍的 ticks 数
 
-        # 初始化多声部数据结构
+        # 提取拍号信息（取第一个拍号事件，如果存在）
+        if midi_data.time_signature_changes:
+            ts = midi_data.time_signature_changes[0]
+            global_time_signature = (ts.numerator, ts.denominator)
+            print(f"检测到拍号: {ts.numerator}/{ts.denominator}")
+        else:
+            print("未检测到拍号信息，默认 4/4")
+
         all_voices_notes = []
 
         # 遍历每个乐器（声部）
@@ -470,23 +479,18 @@ def preprocess_midi(midi_file_path):
             if instrument.is_drum:
                 continue  # 跳过鼓轨道
 
-            # 动态设置通道音色
-            channel = instrument.program % 16  # 确保通道号在0-15范围内
-            target_program = instrument.program % 128  # 规范Program范围(0-127)
-            
+            channel = instrument.program % 16
+            target_program = instrument.program % 128
+
             with fluid_lock:
                 try:
-                    # 关键修复：使用正确的sfid参数，添加bank自动探测
-                    # 尝试默认bank 0
                     fs.program_select(channel, sfid, 0, target_program)
                     print(f"通道{channel} 设置成功: Bank 0, Program {target_program}")
                 except fluidsynth.FluidError:
                     try:
-                        # 尝试通用bank 128
                         fs.program_select(channel, sfid, 128, target_program)
                         print(f"通道{channel} 使用Bank 128, Program {target_program}")
                     except fluidsynth.FluidError:
-                        # 回退到默认钢琴音色
                         fs.program_select(channel, sfid, 0, 0)
                         print(f"通道{channel} 音色不可用，已回退到钢琴")
 
@@ -494,10 +498,11 @@ def preprocess_midi(midi_file_path):
                 "name": instrument.name if instrument.name else "Unnamed",
                 "program": channel,
                 "notes": [],
-                "original_bpm": bpm
+                "original_bpm": bpm,
+                "next_note_index": 0  # 新增字段，用于跟踪本声部下一次要播放的音符
             }
 
-            # 收集原始音符数据（秒为单位）
+            # 收集原始音符数据（以秒为单位）
             for note in instrument.notes:
                 voice_notes["notes"].append({
                     "pitch": note.pitch,
@@ -506,7 +511,8 @@ def preprocess_midi(midi_file_path):
                     "velocity": note.velocity,
                     "duration_sec": note.end - note.start
                 })
-
+            # 对音符列表按起始时间排序，确保后续按顺序播放
+            voice_notes["notes"].sort(key=lambda n: n["start_sec"])
             all_voices_notes.append(voice_notes)
 
         return all_voices_notes, ticks_per_beat, bpm
@@ -515,7 +521,6 @@ def preprocess_midi(midi_file_path):
         print(f"解析 MIDI 文件时出错: {e}")
         cleanup_fluidsynth()
         exit()
-        
 
 
 
@@ -652,16 +657,9 @@ def panic_non_cross_notes():
 import threading
 
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
-    """
-    改进后的 MIDI 播放逻辑：
-      1. 对于跨拍音符，其播放时值按当前 BPM 重新计算；
-      2. 当触发新的 play beat 指令时，如果已有播放线程仍在运行，则通过设置 stop_playback
-         标志使当前播放线程提前退出（仅中断未完成的 note_on 排队），同时调用 panic_non_cross_notes()
-         仅中断非跨拍音符；
-      3. 新的播放线程为本拍排队的事件均增加 'beat' 属性，供 MIDI 事件处理时判断。
-    """
+
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
-    global global_active_notes, global_notes_lock, midi_queue, beat_lock
+    global global_active_notes, global_notes_lock, midi_queue, beat_lock, global_time_signature
 
     if not play_beat_command or fs is None:
         return
@@ -680,7 +678,9 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     with beat_lock:
         current_beat += 1
         interrupt_flag = True
-        beat_duration = 60.0 / max(20, min(current_bpm, 300))  # 限制 BPM 范围
+        # 根据 BPM 及拍号计算一拍时长
+        _, denominator = global_time_signature
+        beat_duration = (60.0 / current_bpm) * (4 / denominator)
         start_time = (current_beat - 1) * beat_duration
         end_time = current_beat * beat_duration
 
@@ -690,25 +690,33 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
         interrupt_flag = False
         events = []
         try:
-            # 遍历所有声部中的音符
+            # 遍历所有声部
             for voice in all_voices_notes:
                 program = voice["program"]
-                for note in voice["notes"]:
+                notes = voice["notes"]
+                idx = voice["next_note_index"]
+                # 处理从 idx 开始的音符（音符列表已排序）
+                while idx < len(notes):
+                    note = notes[idx]
                     note_start = note["start_sec"]
                     note_end = note["end_sec"]
                     if note_end <= note_start:
+                        idx += 1
                         continue
-                    # 仅处理在当前拍内启动的音符
+                    # 如果该音符已经在当前拍之前，则跳过（更新 idx）
+                    if note_start < start_time:
+                        idx += 1
+                        continue
+                    # 如果该音符的起始时间落在当前拍内，则排队播放
                     if start_time <= note_start < end_time:
                         if note_end > end_time:
-                            # 跨拍音符：按当前 BPM 重算时值
+                            # 跨拍音符：按当前 BPM 重新计算时值
                             new_duration = note["duration_sec"] * (current_bpm / 60)
                             note_off_time = note_start + new_duration
                             cross_flag = True
                         else:
                             note_off_time = note_end
                             cross_flag = False
-                        # 为每个事件增加当前拍号属性 'beat'
                         events.append({
                             "type": "note_on",
                             "time": note_start,
@@ -726,6 +734,12 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                             "cross_beat": cross_flag,
                             "beat": current_beat
                         })
+                        idx += 1
+                    else:
+                        # 如果该音符的起始时间超出当前拍，则后面的音符也不在当前拍内
+                        break
+                # 更新该声部的 next_note_index
+                voice["next_note_index"] = idx
 
             # 按时间顺序排序所有事件
             events.sort(key=lambda x: x["time"])
@@ -734,23 +748,16 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
             # 逐个调度事件
             for event in events:
                 event_offset = event["time"] - start_time
-                # 等待直到达到事件的时间
                 while (time.perf_counter() - playback_start) < event_offset:
-                    # 如果检测到中断标志，并且当前事件是 note_on，则直接跳过后续 note_on 排队
-                    if (time.perf_counter() - playback_start) < event_offset:
-                        if (stop_playback or interrupt_flag) and event["type"] == "note_on":
-                            break
+                    if (stop_playback or interrupt_flag) and event["type"] == "note_on":
+                        break
                     time.sleep(0.01)
-                # 如果中断标志触发且当前事件为 note_on，则跳过排入队列；
-                # note_off 事件无论如何都需要排入队列，以便在预定时长后关闭音符
                 if (stop_playback or interrupt_flag) and event["type"] == "note_on":
                     continue
                 midi_queue.put(event)
         finally:
-            # 播放线程结束后不做额外处理
             pass
 
-    # 启动新的播放线程
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
 
