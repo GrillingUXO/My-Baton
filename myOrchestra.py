@@ -34,7 +34,7 @@ global_notes_lock = threading.Lock()
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.2, min_tracking_confidence=0.2)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.1, min_tracking_confidence=0.1)
 
 
 rhythm_hand_label = None  # 节奏手的左右信息（"Left" 或 "Right"）
@@ -50,7 +50,7 @@ stop_playback = False
 
 
 # 在全局变量定义区添加以下变量
-pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.2, min_tracking_confidence=0.2)
+pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.1, min_tracking_confidence=0.1)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
@@ -137,9 +137,10 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     - 新增返回值 play_beat_command (是否触发播放)
     - 新增返回值 current_bpm (当前帧计算的 BPM)
     - 在检测到新的 BPM 时，输出当前动态 BPM 到控制台
+    - **新增逻辑：如果当前全局中仍有非跨拍音符正在播放，则不触发 play beat 命令。**
     """
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
-    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time
+    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock
 
     # 初始化控制信号变量
     play_beat_command = False      # 节拍播放触发标志
@@ -229,21 +230,29 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 # 计算当前帧手部运动速度（这里不使用帧间 delta_time，而是关注是否超过阈值）
                 # 若速度与位移均超过阈值，则认为处于挥手状态
                 if distance > distance_threshold and (distance > 0):
-                    # 如果当前处于等待放缓状态，则不更新 BPM
                     if not process_frame_with_hand_detection.waiting_for_rest:
-                        # 如果上次挥手记录存在，则计算间隔
-                        if process_frame_with_hand_detection.last_swing_time is not None:
-                            interval = time.time() - process_frame_with_hand_detection.last_swing_time
-                            if interval >= MIN_INTERVAL:
-                                current_bpm = max(60, min(200, 60 / interval))
-                                print(f"检测到动态 BPM: {current_bpm:.2f}")  # 输出当前动态 BPM 到控制台
-                                play_beat_command = True
-                                new_last_stop_time = time.time()
+                        # 新增：在触发 play beat 命令前，检查当前是否仍有非跨拍音符在播放
+                        with global_notes_lock:
+                            active_non_cross = any(
+                                not note_info.get("cross_beat", False) 
+                                for note_info in global_active_notes.values()
+                            )
+                        if active_non_cross:
+                            # 如果还有非跨拍音符在播放，则不触发 play beat 命令
+                            play_beat_command = False
                         else:
-                            new_last_stop_time = time.time()
-                        # 记录本次挥手时间并进入等待放缓状态
-                        process_frame_with_hand_detection.last_swing_time = time.time()
-                        process_frame_with_hand_detection.waiting_for_rest = True
+                            # 如果上次挥手记录存在，则计算间隔
+                            if process_frame_with_hand_detection.last_swing_time is not None:
+                                interval = time.time() - process_frame_with_hand_detection.last_swing_time
+                                if interval >= MIN_INTERVAL:
+                                    current_bpm = max(50, min(200, 60 / interval))
+                                    print(f"检测到动态 BPM: {current_bpm:.2f}")
+                                    play_beat_command = True
+                                    new_last_stop_time = time.time()
+                            else:
+                                new_last_stop_time = time.time()
+                            process_frame_with_hand_detection.last_swing_time = time.time()
+                            process_frame_with_hand_detection.waiting_for_rest = True
                 else:
                     # 当手部运动低于阈值时，允许下一次挥手检测
                     process_frame_with_hand_detection.waiting_for_rest = False
@@ -287,6 +296,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         play_beat_command,
         current_bpm
     )
+
 
 
 
@@ -535,7 +545,7 @@ def detect_pause_and_calculate_bpm(centroid, current_time, frame):
     if last_stop_time is not None:
         interval = current_time - last_stop_time
         if interval > 0:
-            bpm = max(60, min(200, 60 / interval))  # 限制 BPM 范围
+            bpm = max(50, min(200, 60 / interval))  # 限制 BPM 范围
             note_durations = calculate_note_durations(bpm)
             print(f"动态更新 BPM：{bpm:.2f}")
 
@@ -587,20 +597,23 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
 
 def midi_event_processor():
     """
-    独立线程异步执行 MIDI 事件。
-    从全局队列 midi_queue 中取出事件并按顺序调用 fs.noteon/noteoff，
-    同时记录/清除 global_active_notes 以便于跨拍音符管理。
+    修改后的 MIDI 事件处理线程：
+      - 处理 note_on 和 note_off 事件；
+      - 所有 note_off 事件都将被正常执行，确保跨拍音符在到达预定时长后能被关闭，
+        避免出现无限延长的问题。
     """
-    global fs, stop_playback, fluid_lock, global_active_notes, global_notes_lock
+    global fs, stop_playback, fluid_lock, global_active_notes, global_notes_lock, midi_queue, current_beat
     while True:
         event = midi_queue.get()  # 阻塞等待事件
         with fluid_lock:
             try:
                 if event["type"] == "note_on":
                     fs.noteon(event["channel"], event["pitch"], event["velocity"])
-                    # 记录该音符，并保存是否为跨拍音符
                     with global_notes_lock:
-                        global_active_notes[(event["channel"], event["pitch"])] = {"cross_beat": event.get("cross_beat", False)}
+                        global_active_notes[(event["channel"], event["pitch"])] = {
+                            "cross_beat": event.get("cross_beat", False),
+                            "beat": event.get("beat")
+                        }
                 elif event["type"] == "note_off":
                     fs.noteoff(event["channel"], event["pitch"])
                     with global_notes_lock:
@@ -610,6 +623,8 @@ def midi_event_processor():
             except fluidsynth.FluidError as e:
                 print(f"FluidSynth Error in midi_event_processor: {e}")
         midi_queue.task_done()
+
+
 
 
 def panic_non_cross_notes():
@@ -638,21 +653,20 @@ import threading
 
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
     """
-    改进的 MIDI 播放逻辑：
-      1. 对于跨拍音符，其播放时值按当前实时 BPM 重新计算：
-         如果原曲音符时值为 note["duration_sec"]（例如 1 秒），
-         则新时值 = note["duration_sec"] * (current_bpm / 60)
-      2. 当触发下一个 play beat 指令时，
-         若前一拍播放线程仍在运行，则只中断非跨拍音符，
-         使得跨拍音符继续播放。
+    改进后的 MIDI 播放逻辑：
+      1. 对于跨拍音符，其播放时值按当前 BPM 重新计算；
+      2. 当触发新的 play beat 指令时，如果已有播放线程仍在运行，则通过设置 stop_playback
+         标志使当前播放线程提前退出（仅中断未完成的 note_on 排队），同时调用 panic_non_cross_notes()
+         仅中断非跨拍音符；
+      3. 新的播放线程为本拍排队的事件均增加 'beat' 属性，供 MIDI 事件处理时判断。
     """
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
-    global global_active_notes, global_notes_lock, midi_queue
+    global global_active_notes, global_notes_lock, midi_queue, beat_lock
 
     if not play_beat_command or fs is None:
         return
 
-    # 若已有播放线程还在运行，则中断【非跨拍】的音符
+    # 如果已有播放线程仍在运行，则中断该线程（仅中断未完成的 note_on 排队）
     if playback_thread and playback_thread.is_alive():
         stop_playback = True
         try:
@@ -662,7 +676,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
         finally:
             panic_non_cross_notes()
 
-    # 计算当前拍的时间范围
+    # 更新拍子相关信息（使用 beat_lock 保护对 current_beat 的更新）
     with beat_lock:
         current_beat += 1
         interrupt_flag = True
@@ -671,11 +685,10 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
         end_time = current_beat * beat_duration
 
     def play_notes():
-        global stop_playback, interrupt_flag, midi_queue
+        global stop_playback, interrupt_flag, midi_queue, current_beat
         stop_playback = False
         interrupt_flag = False
         events = []
-
         try:
             # 遍历所有声部中的音符
             for voice in all_voices_notes:
@@ -683,60 +696,65 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                 for note in voice["notes"]:
                     note_start = note["start_sec"]
                     note_end = note["end_sec"]
-
                     if note_end <= note_start:
                         continue
-
-                    # 仅处理那些在当前拍内启动的音符
+                    # 仅处理在当前拍内启动的音符
                     if start_time <= note_start < end_time:
-                        # 判断是否为跨拍音符：即 note_end 超出当前拍子范围
                         if note_end > end_time:
-                            # 采用当前 BPM 重算音符时值：
-                            # 新时值 = 原始时值 * (current_bpm / 60)
+                            # 跨拍音符：按当前 BPM 重算时值
                             new_duration = note["duration_sec"] * (current_bpm / 60)
                             note_off_time = note_start + new_duration
                             cross_flag = True
                         else:
                             note_off_time = note_end
                             cross_flag = False
-
+                        # 为每个事件增加当前拍号属性 'beat'
                         events.append({
                             "type": "note_on",
                             "time": note_start,
                             "pitch": note["pitch"],
                             "velocity": int(note["velocity"] * (volume / 127.0)),
                             "channel": program,
-                            "cross_beat": cross_flag
+                            "cross_beat": cross_flag,
+                            "beat": current_beat
                         })
                         events.append({
                             "type": "note_off",
                             "time": note_off_time,
                             "pitch": note["pitch"],
                             "channel": program,
-                            "cross_beat": cross_flag
+                            "cross_beat": cross_flag,
+                            "beat": current_beat
                         })
 
             # 按时间顺序排序所有事件
             events.sort(key=lambda x: x["time"])
             playback_start = time.perf_counter()
 
-            # 播放 MIDI 事件：异步将事件放入队列，由独立线程处理
+            # 逐个调度事件
             for event in events:
                 event_offset = event["time"] - start_time
+                # 等待直到达到事件的时间
                 while (time.perf_counter() - playback_start) < event_offset:
-                    if stop_playback or interrupt_flag:
-                        break
-                    time.sleep(0.0005)
+                    # 如果检测到中断标志，并且当前事件是 note_on，则直接跳过后续 note_on 排队
+                    if (time.perf_counter() - playback_start) < event_offset:
+                        if (stop_playback or interrupt_flag) and event["type"] == "note_on":
+                            break
+                    time.sleep(0.01)
+                # 如果中断标志触发且当前事件为 note_on，则跳过排入队列；
+                # note_off 事件无论如何都需要排入队列，以便在预定时长后关闭音符
+                if (stop_playback or interrupt_flag) and event["type"] == "note_on":
+                    continue
                 midi_queue.put(event)
-
         finally:
-            # 播放线程结束后不做额外处理，允许跨拍音符继续播放到自然结束
+            # 播放线程结束后不做额外处理
             pass
 
-    # 启动播放线程
+    # 启动新的播放线程
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
-    
+
+
 
 def trigger_tuning():
     """
