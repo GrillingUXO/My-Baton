@@ -20,10 +20,11 @@ class ProgramState(Enum):
     EXITING = 3
 
 
-# 新增全局变量区
+
 current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
 global_time_signature = (4, 4)
+prev_control_position = None
 
 
 global_active_notes = {}  # 格式: {(channel, pitch): {"end_sec": float, "velocity": int}}
@@ -34,7 +35,7 @@ global_notes_lock = threading.Lock()
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.1, min_tracking_confidence=0.1)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.2, min_tracking_confidence=0.2)
 
 
 rhythm_hand_label = None  # 节奏手的左右信息（"Left" 或 "Right"）
@@ -50,7 +51,7 @@ stop_playback = False
 
 
 # 在全局变量定义区添加以下变量
-pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.1, min_tracking_confidence=0.1)
+pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.2, min_tracking_confidence=0.2)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
@@ -103,18 +104,6 @@ fs = None  # FluidSynth instance
 def select_midi_and_soundfont_files():
     """Select MIDI and SoundFont files using a GUI dialog."""
     global soundfont_path
-
-    # Select MIDI file
-    print("请选择 MIDI 文件。")
-    midi_file_path = filedialog.askopenfilename(
-        title="选择 MIDI 文件",
-        filetypes=[("MIDI 文件", "*.mid"), ("所有文件", "*.*")]
-    )
-    if not midi_file_path:
-        print("未选择 MIDI 文件，程序退出。")
-        cleanup_fluidsynth()
-        exit()
-
     # Select SoundFont file
     print("请选择 SoundFont 文件。")
     soundfont_path = filedialog.askopenfilename(
@@ -144,12 +133,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
     # 初始化控制信号变量
     play_beat_command = False      # 节拍播放触发标志
-    current_bpm = bpm              # 当前计算的 BPM（默认使用全局值）
+    current_bpm = bpm              # 当前计算的 BPM
     new_last_stop_time = last_stop_time  # 用于存储新的挥手时间
 
-    # 设置参数阈值
-    speed_threshold = 300
-    distance_threshold = 200
+    speed_threshold = 180
+    distance_threshold = 100
     MIN_INTERVAL = 0.3             # 最小挥手间隔（秒）
 
     # 静态变量：记录上一次挥手时间以及是否在等待手势放缓
@@ -271,10 +259,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                                      (control_wrist_pos[1] - torso_center[1])**2)**0.5
                 current_time = time.time()
                 if last_volume_update_time is None or current_time - last_volume_update_time > 0.2:
-                    if distance_to_torso < 150:
-                        velocity = max(0, velocity - 5)
-                    elif distance_to_torso > 250:
+                    if distance_to_torso < 130:
+                        velocity = max(10, velocity - 5)
+                    elif distance_to_torso > 200:
                         velocity = min(127, velocity + 5)
+                    # 50 到 100 之间则不改变 velocity
                     with fluid_lock:
                         fs.cc(0, 7, velocity)
                     last_volume_update_time = current_time
@@ -296,7 +285,6 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         play_beat_command,
         current_bpm
     )
-
 
 
 
