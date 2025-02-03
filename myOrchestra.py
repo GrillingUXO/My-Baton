@@ -76,17 +76,6 @@ last_stop_time = None
 prev_direction = None
 current_beat = 0
 play_parameters = {"velocity": velocity, "volume": volume}
-# 初始化全局变量
-
-
-# 全局变量
-hand_hist = None  # 手部直方图
-motion_amplitude = []  # 运动幅度缓冲区
-animation_point = None  # 停顿动画位置
-animation_start_time = None  # 停顿动画开始时间
-animation_duration = 0.5  # 停顿动画持续时间
-STOP_THRESHOLD = 50  # 停顿检测的运动幅度阈值
-
 
 last_stop_position = None
 motion_distance_since_last_stop = 0
