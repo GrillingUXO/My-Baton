@@ -120,16 +120,11 @@ def select_midi_and_soundfont_files():
 
 
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
-    """
-    使用 MediaPipe 检测两只手的动作并处理逻辑，返回控制信号和状态
-    修改点：
-    - 新增返回值 play_beat_command (是否触发播放)
-    - 新增返回值 current_bpm (当前帧计算的 BPM)
-    - 在检测到新的 BPM 时，输出当前动态 BPM 到控制台
-    - **新增逻辑：如果当前全局中仍有非跨拍音符正在播放，则不触发 play beat 命令。**
-    """
+
+    
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
     global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock
+
 
     # 初始化控制信号变量
     play_beat_command = False      # 节拍播放触发标志
@@ -150,7 +145,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     pose_result = pose.process(rgb_frame)
     torso_center = None
     if pose_result.pose_landmarks:
-        #mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+        # mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
         left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
         torso_center = (
@@ -184,7 +179,6 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
         # 节奏手逻辑
         if rhythm_hand:
-            #mp_drawing.draw_landmarks(frame, rhythm_hand, mp_hands.HAND_CONNECTIONS)
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
@@ -196,15 +190,8 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 mouvement_distance_threshold = 0.02 * frame.shape[0]
                 if mouvement_distance > mouvement_distance_threshold:
                     angle = math.degrees(math.atan2(dy, dx))
-                    if -45 <= angle < 45:
-                        scrolling = "Scrolling right"
-                    elif 45 <= angle < 135:
-                        scrolling = "Scrolling up"
-                    elif angle >= 135 or angle < -135:
-                        scrolling = "Scrolling left"
-                    else:
-                        scrolling = "Scrolling down"
-                    cv2.putText(frame, scrolling, (wrist_pos[0] + 20, wrist_pos[1] - 20),
+                    # 此处仍保留滚动方向的绘制（若需要，可注释掉）
+                    cv2.putText(frame, f"{angle:.1f}", (wrist_pos[0] + 20, wrist_pos[1] - 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
             # 挥手触发检测
@@ -212,21 +199,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
                 distance = (dx**2 + dy**2)**0.5
-                # 计算当前帧手部运动速度（这里不使用帧间 delta_time，而是关注是否超过阈值）
-                # 若速度与位移均超过阈值，则认为处于挥手状态
                 if distance > distance_threshold and (distance > 0):
                     if not process_frame_with_hand_detection.waiting_for_rest:
-                        # 新增：在触发 play beat 命令前，检查当前是否仍有非跨拍音符在播放
                         with global_notes_lock:
                             active_non_cross = any(
-                                not note_info.get("cross_beat", False) 
+                                not note_info.get("cross_beat", False)
                                 for note_info in global_active_notes.values()
                             )
                         if active_non_cross:
-                            # 如果还有非跨拍音符在播放，则不触发 play beat 命令
                             play_beat_command = False
                         else:
-                            # 如果上次挥手记录存在，则计算间隔
                             if process_frame_with_hand_detection.last_swing_time is not None:
                                 interval = time.time() - process_frame_with_hand_detection.last_swing_time
                                 if interval >= MIN_INTERVAL:
@@ -239,16 +221,12 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             process_frame_with_hand_detection.last_swing_time = time.time()
                             process_frame_with_hand_detection.waiting_for_rest = True
                 else:
-                    # 当手部运动低于阈值时，允许下一次挥手检测
                     process_frame_with_hand_detection.waiting_for_rest = False
 
             prev_position = wrist_pos
-            cv2.putText(frame, "Rhythm Hand", (wrist_pos[0] - 50, wrist_pos[1] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
+            cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
 
         if control_hand:
-            #mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
             control_wrist_pos = (int(control_wrist.x * frame.shape[1]), int(control_wrist.y * frame.shape[0]))
             if torso_center:
@@ -260,14 +238,12 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                         velocity = max(10, velocity - 5)
                     elif distance_to_torso > 1:
                         velocity = min(127, velocity + 5)
-                        
                     with fluid_lock:
                         fs.cc(0, 7, velocity)
                     last_volume_update_time = current_time
                 cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10, 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, "Control Hand", (control_wrist_pos[0] - 50, control_wrist_pos[1] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
     cv2.putText(frame, f"Play Command: {play_beat_command}", (10, 200),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
