@@ -644,56 +644,28 @@ import threading
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
     global global_active_notes, global_notes_lock, midi_queue, beat_lock, global_time_signature
-    global global_playback_start_time  # 新增全局变量，用于记录当前播放段开始时间
+    global global_playback_start_time  # 用于记录当前播放段起始时间
 
     if not play_beat_command or fs is None:
         return
 
     # 如果已有播放线程仍在运行，则判断是否允许打断当前播放段
     if playback_thread and playback_thread.is_alive():
-        # 计算当前播放段（即当前 beat）的起止时间
-        with beat_lock:
-            current_beat_value = current_beat  # 当前正在播放的拍号
+        # 根据当前 BPM 计算当前拍（beat）的时长
         _, denominator = global_time_signature
         beat_duration = (60.0 / current_bpm) * (4 / denominator)
-        current_beat_start = (current_beat_value - 1) * beat_duration
-        current_beat_end = current_beat_value * beat_duration
+        # 后25%的时长允许打断
+        allowed_interrupt_offset = beat_duration * 0.75
+        # 计算当前播放段已进行的时长
+        if 'global_playback_start_time' not in globals() or global_playback_start_time is None:
+            current_progress = 0
+        else:
+            current_progress = time.perf_counter() - global_playback_start_time
+        # 如果当前播放进度尚未进入最后25%，则不允许打断
+        if current_progress < allowed_interrupt_offset:
+            return
 
-        # 遍历所有声部，收集当前拍内所有非跨拍音符的结束时间
-        non_cross_end = None
-        for voice in all_voices_notes:
-            notes = voice["notes"]
-            idx = voice["next_note_index"]
-            while idx < len(notes):
-                note = notes[idx]
-                note_start = note["start_sec"]
-                note_end = note["end_sec"]
-                if note_start < current_beat_start:
-                    idx += 1
-                    continue
-                if note_start >= current_beat_end:
-                    break
-                # 仅考虑不跨拍的音符
-                if note_end <= current_beat_end:
-                    if non_cross_end is None or note_end > non_cross_end:
-                        non_cross_end = note_end
-                idx += 1
-
-        # 如果存在非跨拍音符，则只有在其播放进度达到前3/4时才允许打断
-        if non_cross_end is not None:
-            # 计算非跨拍音符整体的时值（相对于当前拍开始的时长）
-            non_cross_duration = non_cross_end - current_beat_start
-            allowed_interrupt_offset = non_cross_duration * 0.75
-            # 如果未记录播放段起始时间，则假定刚刚开始
-            if 'global_playback_start_time' not in globals() or global_playback_start_time is None:
-                current_progress = 0
-            else:
-                current_progress = time.perf_counter() - global_playback_start_time
-            if current_progress < allowed_interrupt_offset:
-                # 当前播放段非跨拍部分播放还未到后1/4，不允许打断
-                return
-
-        # 达到或超过后1/4时，允许打断：中断当前播放线程并关闭所有非跨拍音符
+        # 达到或超过后25%时，允许打断：中断当前播放线程并关闭所有非跨拍音符
         stop_playback = True
         try:
             playback_thread.join(timeout=0.05)
