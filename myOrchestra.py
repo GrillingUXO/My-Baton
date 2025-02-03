@@ -136,9 +136,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     current_bpm = bpm              # 当前计算的 BPM
     new_last_stop_time = last_stop_time  # 用于存储新的挥手时间
 
-    speed_threshold = 180
-    distance_threshold = 100
-    MIN_INTERVAL = 0.3             # 最小挥手间隔（秒）
+    speed_threshold = 100
+    distance_threshold = 60
+    MIN_INTERVAL = 0.1            # 最小挥手间隔（秒）
 
     # 静态变量：记录上一次挥手时间以及是否在等待手势放缓
     if not hasattr(process_frame_with_hand_detection, "last_swing_time"):
@@ -146,12 +146,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     if not hasattr(process_frame_with_hand_detection, "waiting_for_rest"):
         process_frame_with_hand_detection.waiting_for_rest = False
 
-    # 躯干检测逻辑（完整保留）
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pose_result = pose.process(rgb_frame)
     torso_center = None
     if pose_result.pose_landmarks:
-        mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+        #mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
         left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
         torso_center = (
@@ -160,13 +159,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         )
         cv2.circle(frame, torso_center, 5, (0, 255, 0), -1)
 
-    # 手势检测逻辑（完整保留）
     hand_result = hands.process(rgb_frame)
     if hand_result.multi_hand_landmarks and hand_result.multi_handedness:
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
-        # 绑定节奏手和变化手（完整逻辑）
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
                 label = handedness.classification[0].label
@@ -187,7 +184,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
         # 节奏手逻辑
         if rhythm_hand:
-            mp_drawing.draw_landmarks(frame, rhythm_hand, mp_hands.HAND_CONNECTIONS)
+            #mp_drawing.draw_landmarks(frame, rhythm_hand, mp_hands.HAND_CONNECTIONS)
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
@@ -233,7 +230,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             if process_frame_with_hand_detection.last_swing_time is not None:
                                 interval = time.time() - process_frame_with_hand_detection.last_swing_time
                                 if interval >= MIN_INTERVAL:
-                                    current_bpm = max(50, min(200, 60 / interval))
+                                    current_bpm = max(60, min(200, 60 / interval))
                                     print(f"检测到动态 BPM: {current_bpm:.2f}")
                                     play_beat_command = True
                                     new_last_stop_time = time.time()
@@ -249,9 +246,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             cv2.putText(frame, "Rhythm Hand", (wrist_pos[0] - 50, wrist_pos[1] - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 变化手逻辑（保持不变）
+
         if control_hand:
-            mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
+            #mp_drawing.draw_landmarks(frame, control_hand, mp_hands.HAND_CONNECTIONS)
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
             control_wrist_pos = (int(control_wrist.x * frame.shape[1]), int(control_wrist.y * frame.shape[0]))
             if torso_center:
@@ -259,11 +256,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                                      (control_wrist_pos[1] - torso_center[1])**2)**0.5
                 current_time = time.time()
                 if last_volume_update_time is None or current_time - last_volume_update_time > 0.2:
-                    if distance_to_torso < 130:
+                    if distance_to_torso < 80:
                         velocity = max(10, velocity - 5)
-                    elif distance_to_torso > 200:
+                    elif distance_to_torso > 1:
                         velocity = min(127, velocity + 5)
-                    # 50 到 100 之间则不改变 velocity
+                        
                     with fluid_lock:
                         fs.cc(0, 7, velocity)
                     last_volume_update_time = current_time
@@ -538,7 +535,7 @@ def detect_pause_and_calculate_bpm(centroid, current_time, frame):
     if last_stop_time is not None:
         interval = current_time - last_stop_time
         if interval > 0:
-            bpm = max(50, min(200, 60 / interval))  # 限制 BPM 范围
+            bpm = max(60, min(200, 60 / interval))  # 限制 BPM 范围
             note_durations = calculate_note_durations(bpm)
             print(f"动态更新 BPM：{bpm:.2f}")
 
@@ -565,7 +562,7 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
     通用的停顿检测逻辑，用于检测手势停顿。
     返回停顿状态和更新后的运动幅度缓冲区。
     """
-    STOP_THRESHOLD = 50  # 停顿运动幅度阈值
+    STOP_THRESHOLD = 30  # 停顿运动幅度阈值
     dx = current_position[0] - prev_position[0]
     dy = current_position[1] - prev_position[1]
     distance = (dx**2 + dy**2)**0.5
@@ -645,15 +642,58 @@ def panic_non_cross_notes():
 import threading
 
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
-
     global fs, playback_thread, stop_playback, current_beat, interrupt_flag, fluid_lock
     global global_active_notes, global_notes_lock, midi_queue, beat_lock, global_time_signature
+    global global_playback_start_time  # 新增全局变量，用于记录当前播放段开始时间
 
     if not play_beat_command or fs is None:
         return
 
-    # 如果已有播放线程仍在运行，则中断该线程（仅中断未完成的 note_on 排队）
+    # 如果已有播放线程仍在运行，则判断是否允许打断当前播放段
     if playback_thread and playback_thread.is_alive():
+        # 计算当前播放段（即当前 beat）的起止时间
+        with beat_lock:
+            current_beat_value = current_beat  # 当前正在播放的拍号
+        _, denominator = global_time_signature
+        beat_duration = (60.0 / current_bpm) * (4 / denominator)
+        current_beat_start = (current_beat_value - 1) * beat_duration
+        current_beat_end = current_beat_value * beat_duration
+
+        # 遍历所有声部，收集当前拍内所有非跨拍音符的结束时间
+        non_cross_end = None
+        for voice in all_voices_notes:
+            notes = voice["notes"]
+            idx = voice["next_note_index"]
+            while idx < len(notes):
+                note = notes[idx]
+                note_start = note["start_sec"]
+                note_end = note["end_sec"]
+                if note_start < current_beat_start:
+                    idx += 1
+                    continue
+                if note_start >= current_beat_end:
+                    break
+                # 仅考虑不跨拍的音符
+                if note_end <= current_beat_end:
+                    if non_cross_end is None or note_end > non_cross_end:
+                        non_cross_end = note_end
+                idx += 1
+
+        # 如果存在非跨拍音符，则只有在其播放进度达到前3/4时才允许打断
+        if non_cross_end is not None:
+            # 计算非跨拍音符整体的时值（相对于当前拍开始的时长）
+            non_cross_duration = non_cross_end - current_beat_start
+            allowed_interrupt_offset = non_cross_duration * 0.75
+            # 如果未记录播放段起始时间，则假定刚刚开始
+            if 'global_playback_start_time' not in globals() or global_playback_start_time is None:
+                current_progress = 0
+            else:
+                current_progress = time.perf_counter() - global_playback_start_time
+            if current_progress < allowed_interrupt_offset:
+                # 当前播放段非跨拍部分播放还未到后1/4，不允许打断
+                return
+
+        # 达到或超过后1/4时，允许打断：中断当前播放线程并关闭所有非跨拍音符
         stop_playback = True
         try:
             playback_thread.join(timeout=0.05)
@@ -666,19 +706,18 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     with beat_lock:
         current_beat += 1
         interrupt_flag = True
-        # 根据 BPM 及拍号计算一拍时长
         _, denominator = global_time_signature
         beat_duration = (60.0 / current_bpm) * (4 / denominator)
         start_time = (current_beat - 1) * beat_duration
         end_time = current_beat * beat_duration
 
     def play_notes():
-        global stop_playback, interrupt_flag, midi_queue, current_beat
+        global stop_playback, interrupt_flag, midi_queue, current_beat, global_playback_start_time
         stop_playback = False
         interrupt_flag = False
         events = []
         try:
-            # 遍历所有声部
+            # 遍历所有声部，收集当前拍内的音符事件
             for voice in all_voices_notes:
                 program = voice["program"]
                 notes = voice["notes"]
@@ -691,11 +730,11 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                     if note_end <= note_start:
                         idx += 1
                         continue
-                    # 如果该音符已经在当前拍之前，则跳过（更新 idx）
+                    # 跳过当前拍之前的音符
                     if note_start < start_time:
                         idx += 1
                         continue
-                    # 如果该音符的起始时间落在当前拍内，则排队播放
+                    # 仅处理落在当前拍内的音符
                     if start_time <= note_start < end_time:
                         if note_end > end_time:
                             # 跨拍音符：按当前 BPM 重新计算时值
@@ -724,19 +763,21 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                         })
                         idx += 1
                     else:
-                        # 如果该音符的起始时间超出当前拍，则后面的音符也不在当前拍内
+                        # 后续音符不在当前拍内
                         break
                 # 更新该声部的 next_note_index
                 voice["next_note_index"] = idx
 
             # 按时间顺序排序所有事件
             events.sort(key=lambda x: x["time"])
-            playback_start = time.perf_counter()
+            local_playback_start = time.perf_counter()
+            # 记录播放段起始时间，用于打断判断
+            global_playback_start_time = local_playback_start
 
             # 逐个调度事件
             for event in events:
                 event_offset = event["time"] - start_time
-                while (time.perf_counter() - playback_start) < event_offset:
+                while (time.perf_counter() - local_playback_start) < event_offset:
                     if (stop_playback or interrupt_flag) and event["type"] == "note_on":
                         break
                     time.sleep(0.01)
@@ -748,6 +789,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
 
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
+
 
 
 
@@ -903,6 +945,7 @@ def main():
                 break
 
             frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
+            frame = cv2.resize(frame, (int(frame.shape[1] * 0.7), int(frame.shape[0] * 0.7)))
 
             check_and_trigger_tuning(frame)
 
