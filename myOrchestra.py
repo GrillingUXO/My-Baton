@@ -262,63 +262,6 @@ def calculate_angle(vec1, vec2):
     return math.degrees(math.acos(cos_theta))
 
 
-
-
-def hist_masking(frame, hist):
-    """基于 MediaPipe Hands 检测手部区域，并生成掩模。"""
-    global hands, mp_drawing, mp_hands
-
-    # 将图像转换为 RGB 格式，因为 MediaPipe 使用的是 RGB 输入
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb_frame)
-
-    # 如果检测到手部
-    if result.multi_hand_landmarks:
-        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-        for hand_landmarks in result.multi_hand_landmarks:
-            # 将手部关键点投影到图像上
-            hand_points = [(int(p.x * frame.shape[1]), int(p.y * frame.shape[0])) for p in hand_landmarks.landmark]
-            hull = cv2.convexHull(np.array(hand_points, dtype=np.int32))  # 生成手部凸包
-            cv2.drawContours(mask, [hull], -1, 255, thickness=cv2.FILLED)  # 填充手部区域
-
-        # 使用生成的掩模对帧进行隔离
-        masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
-        return masked_frame
-    else:
-        # 未检测到手时返回空帧
-        return np.zeros_like(frame)
-
-def contours(hist_mask_image):
-    """返回基于 MediaPipe 检测的手部关键点轮廓。"""
-    global hands, mp_hands
-
-    rgb_frame = cv2.cvtColor(hist_mask_image, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb_frame)
-
-    if result.multi_hand_landmarks:
-        contours_list = []
-        for hand_landmarks in result.multi_hand_landmarks:
-            # 获取手部关键点投影
-            hand_points = [(int(p.x * hist_mask_image.shape[1]), int(p.y * hist_mask_image.shape[0])) for p in hand_landmarks.landmark]
-            hull = cv2.convexHull(np.array(hand_points, dtype=np.int32))
-            contours_list.append(hull)
-        return contours_list
-    return []
-
-
-def centroid(max_contour):
-    """计算基于 MediaPipe 关键点的手部中心点。"""
-    if max_contour is None or len(max_contour) == 0:
-        return None
-    moment = cv2.moments(np.array(max_contour))
-    if moment['m00'] != 0:
-        cx = int(moment['m10'] / moment['m00'])
-        cy = int(moment['m01'] / moment['m00'])
-        return cx, cy
-    return None
-
-
-
 def start_fluidsynth():
     global fs, soundfont_path, sfid
 
