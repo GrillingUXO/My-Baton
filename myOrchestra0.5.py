@@ -486,7 +486,6 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
     return False, motion_amplitude, stop_detected
 
 
-
 def midi_event_processor():
     """
     修改后的 MIDI 事件处理线程：
@@ -541,7 +540,6 @@ def panic_non_cross_notes():
                 del global_active_notes[key]
 
 
-
 import threading
 
 def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, volume, frame):
@@ -552,44 +550,37 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     if not play_beat_command or fs is None:
         return
 
-    # 如果已有播放线程仍在运行，则判断是否允许打断当前播放段
-    if playback_thread and playback_thread.is_alive():
-        # 根据当前 BPM 计算当前拍（beat）的时长
-        _, denominator = global_time_signature
-        beat_duration = (60.0 / current_bpm) * (4 / denominator)
-        # 后25%的时长允许打断
-        allowed_interrupt_offset = beat_duration * 0.75
-        # 计算当前播放段已进行的时长
-        if 'global_playback_start_time' not in globals() or global_playback_start_time is None:
-            current_progress = 0
-        else:
-            current_progress = time.perf_counter() - global_playback_start_time
-        # 如果当前播放进度尚未进入最后25%，则不允许打断
-        if current_progress < allowed_interrupt_offset:
-            return
+    # 根据当前 BPM 和拍号计算当前拍时长
+    _, denominator = global_time_signature
+    beat_duration = (60.0 / current_bpm) * (4 / denominator)
 
-        # 达到或超过后25%时，允许打断：中断当前播放线程并关闭所有非跨拍音符
-        stop_playback = True
-        try:
-            playback_thread.join(timeout=0.05)
-        except RuntimeError:
-            pass
-        finally:
+    # 如果已有播放线程正在运行，判断当前进度
+    if playback_thread and playback_thread.is_alive():
+        current_progress = time.perf_counter() - global_playback_start_time
+        if current_progress < beat_duration * 0.75:
+            # 如果尚未进入当前拍的后 25%，则忽略新的 play beat 条件
+            return
+        else:
+            # 当前拍已进入后 25%，中断当前非跨拍音符的播放：
+            interrupt_flag = True
             panic_non_cross_notes()
+            # 等待一点时间以确保播放线程能响应中断标志（不阻塞太久）
+            time.sleep(0.05)
 
     # 更新拍子相关信息（使用 beat_lock 保护对 current_beat 的更新）
     with beat_lock:
         current_beat += 1
-        interrupt_flag = True
-        _, denominator = global_time_signature
-        beat_duration = (60.0 / current_bpm) * (4 / denominator)
+        # 重置中断标志，便于新拍的事件调度
+        interrupt_flag = False
         start_time = (current_beat - 1) * beat_duration
         end_time = current_beat * beat_duration
 
     def play_notes():
         global stop_playback, interrupt_flag, midi_queue, current_beat, global_playback_start_time
         stop_playback = False
-        interrupt_flag = False
+        local_playback_start = time.perf_counter()
+        # 记录本次播放段起始时间，用于新一拍的中断判断
+        global_playback_start_time = local_playback_start
         events = []
         try:
             # 遍历所有声部，收集当前拍内的音符事件
@@ -645,18 +636,16 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
 
             # 按时间顺序排序所有事件
             events.sort(key=lambda x: x["time"])
-            local_playback_start = time.perf_counter()
-            # 记录播放段起始时间，用于打断判断
-            global_playback_start_time = local_playback_start
-
             # 逐个调度事件
             for event in events:
                 event_offset = event["time"] - start_time
                 while (time.perf_counter() - local_playback_start) < event_offset:
-                    if (stop_playback or interrupt_flag) and event["type"] == "note_on":
+                    # 如果中断标志被置且当前事件为 note_on 且非跨拍，则跳出等待
+                    if (stop_playback or interrupt_flag) and event["type"] == "note_on" and not event.get("cross_beat", False):
                         break
                     time.sleep(0.01)
-                if (stop_playback or interrupt_flag) and event["type"] == "note_on":
+                # 若中断后遇到非跨拍的 note_on 事件，则跳过该事件
+                if (stop_playback or interrupt_flag) and event["type"] == "note_on" and not event.get("cross_beat", False):
                     continue
                 midi_queue.put(event)
         finally:
@@ -665,51 +654,34 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     playback_thread = threading.Thread(target=play_notes, daemon=True)
     playback_thread.start()
 
+    
 
+def trigger_tuning():
 
-def trigger_tuning(frame, hand_result):
-    """
-    播放 A4 音，并在播放期间显示手部骨架，播放完毕后停止绘制。
-    """
     global fs, fluid_lock
-
-    # **显示手部骨架**
-    for hand_landmarks in hand_result.multi_hand_landmarks:
-        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-    # **播放 A4 音**
+    # 播放 A4 音
     with fluid_lock:
         for channel in range(16):
             try:
                 fs.noteon(channel, 69, 127)
             except Exception as e:
                 print(f"Error in tuning noteon on channel {channel}: {e}")
-
-    time.sleep(2)  # **等待 A4 播放完成**
-
-    # **关闭 A4 音**
+    # 持续 1 秒
+    time.sleep(2)
+    # 关闭 A4 音
     with fluid_lock:
         for channel in range(16):
             try:
                 fs.noteoff(channel, 69)
             except Exception as e:
                 print(f"Error in tuning noteoff on channel {channel}: {e}")
-
-    print("Tuning completed: A4 played for 2 seconds.")
-
-    # **Tuning 结束，退出手部骨架绘制**
-    cv2.destroyAllWindows()
-
+    print("Tuning triggered: A4 played for 1 second.")
 
 
 def check_and_trigger_tuning(frame):
-    """
-    在满足手势条件时触发调音，并在调音期间显示手部骨架，
-    调音完成后退出骨架绘制。
-    """
+
     global tuning_triggered, rhythm_hand_label, control_hand_label, hands, mp_hands, pose
 
-    # 如果已经触发过 Tuning，则直接返回
     if tuning_triggered:
         return
 
@@ -766,10 +738,9 @@ def check_and_trigger_tuning(frame):
             if (rhythm_wrist_pos[1] < torso_center[1] and 
                 control_wrist_pos[1] < torso_center[1] and 
                 rhythm_wrist_pos[1] < control_wrist_pos[1]):
-                
-                # **触发 Tuning 并显示手部骨架**
                 tuning_triggered = True
-                trigger_tuning(frame, hand_result)
+                # 在独立线程中触发调音，避免阻塞主循环
+                threading.Thread(target=trigger_tuning, daemon=True).start()
 
 
 def main():
