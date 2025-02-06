@@ -35,7 +35,7 @@ global_notes_lock = threading.Lock()
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.3, min_tracking_confidence=0.3)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.4, min_tracking_confidence=0.1)
 
 
 rhythm_hand_label = None  # 节奏手的左右信息（"Left" 或 "Right"）
@@ -76,7 +76,7 @@ last_stop_time = None
 prev_direction = None
 current_beat = 0
 play_parameters = {"velocity": velocity, "volume": volume}
-
+staccato_mode = False
 
 last_stop_position = None
 motion_distance_since_last_stop = 0
@@ -109,6 +109,7 @@ def select_midi_and_soundfont_files():
 
 
 
+
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
 
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
@@ -123,11 +124,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     distance_threshold = 70
     MIN_INTERVAL = 0.1            # 最小挥手间隔（秒）
 
-    # 静态变量：记录上一次挥手时间以及是否在等待手势放缓
+    # 静态变量：记录上一次挥手时间
     if not hasattr(process_frame_with_hand_detection, "last_swing_time"):
         process_frame_with_hand_detection.last_swing_time = None
-    if not hasattr(process_frame_with_hand_detection, "waiting_for_rest"):
-        process_frame_with_hand_detection.waiting_for_rest = False
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -148,7 +147,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             int((left_shoulder.x + right_shoulder.x) / 2 * frame.shape[1]),
             int((left_shoulder.y + right_shoulder.y) / 2 * frame.shape[0])
         )
-        cv2.circle(frame, torso_center, 5, (0, 255, 0), -1)
+        #cv2.circle(frame, torso_center, 5, (0, 255, 0), -1)
 
     if hand_result.multi_hand_landmarks and hand_result.multi_handedness:
         hand_landmarks_list = hand_result.multi_hand_landmarks
@@ -177,34 +176,30 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
-            # 挥手触发检测
+            # 挥手触发检测（移除等待放缓条件）
             if prev_position is not None:
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
                 distance = (dx**2 + dy**2)**0.5
                 if distance > distance_threshold and (distance > 0):
-                    if not process_frame_with_hand_detection.waiting_for_rest:
-                        with global_notes_lock:
-                            active_non_cross = any(
-                                not note_info.get("cross_beat", False)
-                                for note_info in global_active_notes.values()
-                            )
-                        if active_non_cross:
-                            play_beat_command = False
-                        else:
-                            if process_frame_with_hand_detection.last_swing_time is not None:
-                                interval = time.time() - process_frame_with_hand_detection.last_swing_time
-                                if interval >= MIN_INTERVAL:
-                                    current_bpm = max(60, min(200, 60 / interval))
-                                    print(f"检测到动态 BPM: {current_bpm:.2f}")
-                                    play_beat_command = True
-                                    new_last_stop_time = time.time()
-                            else:
+                    with global_notes_lock:
+                        active_non_cross = any(
+                            not note_info.get("cross_beat", False)
+                            for note_info in global_active_notes.values()
+                        )
+                    if active_non_cross:
+                        play_beat_command = False
+                    else:
+                        if process_frame_with_hand_detection.last_swing_time is not None:
+                            interval = time.time() - process_frame_with_hand_detection.last_swing_time
+                            if interval >= MIN_INTERVAL:
+                                current_bpm = max(60, min(200, 60 / interval))
+                                print(f"检测到动态 BPM: {current_bpm:.2f}")
+                                play_beat_command = True
                                 new_last_stop_time = time.time()
-                            process_frame_with_hand_detection.last_swing_time = time.time()
-                            process_frame_with_hand_detection.waiting_for_rest = True
-                else:
-                    process_frame_with_hand_detection.waiting_for_rest = False
+                        else:
+                            new_last_stop_time = time.time()
+                        process_frame_with_hand_detection.last_swing_time = time.time()
 
             prev_position = wrist_pos
             cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
@@ -216,21 +211,43 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 distance_to_torso = ((control_wrist_pos[0] - torso_center[0])**2 +
                                      (control_wrist_pos[1] - torso_center[1])**2)**0.5
                 current_time = time.time()
-                if last_volume_update_time is None or current_time - last_volume_update_time > 0.2:
-                    if distance_to_torso < 100:
-                        velocity = max(10, velocity - 8)
-                    elif distance_to_torso > 200:
-                        velocity = min(127, velocity + 8)
-                    with fluid_lock:
-                        fs.cc(0, 7, velocity)
-                    last_volume_update_time = current_time
-                cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # 新的变化手控制逻辑：仅在调音触发后使用记录的基准距离
+                if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
+                    up_threshold = tuning_baseline_distance + 100
+                    down_threshold = tuning_baseline_distance - 100
+                    if distance_to_torso > up_threshold:
+                        extra = distance_to_torso - up_threshold
+                        increments = int(extra // 50)
+                        velocity = min(127, velocity + increments * 8)
+                    elif distance_to_torso < down_threshold:
+                        extra = down_threshold - distance_to_torso
+                        decrements = int(extra // 40)
+                        velocity = max(10, velocity - decrements * 8)
+                    else:
+                        # 距离在上下限之间，按每秒15的速率回退至64
+                        dt = current_time - last_volume_update_time if last_volume_update_time else 0.2
+                        diff = 64 - velocity
+                        change = 15 * dt
+                        if abs(diff) < change:
+                            velocity = 64
+                        else:
+                            if diff > 0:
+                                velocity += change
+                            else:
+                                velocity -= change
+                else:
+                    pass
+
+                with fluid_lock:
+                    fs.cc(0, 7, int(velocity))
+                last_volume_update_time = current_time
+                #cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10, 100),
+                            #cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
     cv2.putText(frame, f"Play Command: {play_beat_command}", (10, 200),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
-    cv2.putText(frame, f"Velocity: {velocity}", (10, 70),
+    cv2.putText(frame, f"Velocity: {int(velocity)}", (10, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
     return (
@@ -244,15 +261,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
 
 
+
 def calculate_angle(vec1, vec2):
-    """计算两向量之间的夹角（单位：度）"""
+
     dot_product = vec1[0] * vec2[0] + vec1[1] * vec2[1]
     magnitude1 = (vec1[0]**2 + vec1[1]**2)**0.5
     magnitude2 = (vec2[0]**2 + vec2[1]**2)**0.5
     if magnitude1 == 0 or magnitude2 == 0:
-        return 0  # 防止除以零
+        return 0 
     cos_theta = dot_product / (magnitude1 * magnitude2)
-    cos_theta = max(-1, min(1, cos_theta))  # 防止浮点误差导致超出范围
+    cos_theta = max(-1, min(1, cos_theta)) 
     return math.degrees(math.acos(cos_theta))
 
 
@@ -557,8 +575,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     # 如果已有播放线程正在运行，判断当前进度
     if playback_thread and playback_thread.is_alive():
         current_progress = time.perf_counter() - global_playback_start_time
-        if current_progress < beat_duration * 0.75:
-            # 如果尚未进入当前拍的后 25%，则忽略新的 play beat 条件
+        if current_progress < beat_duration * 0.2:
             return
         else:
             # 当前拍已进入后 25%，中断当前非跨拍音符的播放：
@@ -680,7 +697,7 @@ def trigger_tuning():
 
 def check_and_trigger_tuning(frame):
 
-    global tuning_triggered, rhythm_hand_label, control_hand_label, hands, mp_hands, pose
+    global tuning_triggered, rhythm_hand_label, control_hand_label, hands, mp_hands, pose, tuning_baseline_distance
 
     if tuning_triggered:
         return
@@ -707,7 +724,6 @@ def check_and_trigger_tuning(frame):
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
-        # 若全局变量未设置，则按出现顺序绑定节奏手和变化手
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
                 label = handedness.classification[0].label
@@ -739,9 +755,14 @@ def check_and_trigger_tuning(frame):
                 control_wrist_pos[1] < torso_center[1] and 
                 rhythm_wrist_pos[1] < control_wrist_pos[1]):
                 tuning_triggered = True
-                # 在独立线程中触发调音，避免阻塞主循环
-                threading.Thread(target=trigger_tuning, daemon=True).start()
+                baseline_distance = ((control_wrist_pos[0] - torso_center[0])**2 +
+                                     (control_wrist_pos[1] - torso_center[1])**2)**0.5
 
+                if not globals().get("tuning_baseline_distance", None):
+                    tuning_baseline_distance = baseline_distance
+                    print(f"Tuning Baseline Distance: {tuning_baseline_distance:.2f}")
+                threading.Thread(target=trigger_tuning, daemon=True).start()
+    
 
 def main():
     global tuning_triggered
