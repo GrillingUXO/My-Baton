@@ -51,7 +51,7 @@ stop_playback = False
 
 
 # 在全局变量定义区添加以下变量
-pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.2, min_tracking_confidence=0.2)
+pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.3, min_tracking_confidence=0.3)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
@@ -216,18 +216,18 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 distance_to_torso = ((control_wrist_pos[0] - torso_center[0])**2 +
                                      (control_wrist_pos[1] - torso_center[1])**2)**0.5
                 current_time = time.time()
-                # 新的变化手控制逻辑：仅在调音触发后使用记录的基准距离
+
                 if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
                     up_threshold = tuning_baseline_distance + 100
                     down_threshold = tuning_baseline_distance - 100
                     if distance_to_torso > up_threshold:
                         extra = distance_to_torso - up_threshold
-                        increments = int(extra // 50)
-                        velocity = min(127, velocity + increments * 12)
+                        increments = int(extra // 30)
+                        velocity = min(127, velocity + increments * 8)
                     elif distance_to_torso < down_threshold:
                         extra = down_threshold - distance_to_torso
-                        decrements = int(extra // 40)
-                        velocity = max(10, velocity - decrements * 12)
+                        decrements = int(extra // 30)
+                        velocity = max(10, velocity - decrements * 8)
                     else:
                         # 距离在上下限之间，按每秒15的速率回退至64
                         dt = current_time - last_volume_update_time if last_volume_update_time else 0.2
@@ -771,9 +771,13 @@ def check_and_trigger_tuning(frame):
 
 
 
+
+
+
+
 def main():
     global tuning_triggered
-    tuning_triggered = False  # 用于确保调音只触发一次
+    tuning_triggered = False 
 
     # 初始化摄像头
     cap = cv2.VideoCapture(0)
@@ -787,7 +791,6 @@ def main():
     beats_notes, ticks_per_beat, bpm = preprocess_midi(midi_file_path)
     total_beats = len(beats_notes) if beats_notes else 0  # 确保存在有效的节拍数据
 
-    # 使用 MIDI 文件原曲 BPM 初始化
     bpm = None  # 初始化 BPM 为 None，确保我们明确地从 MIDI 获取
     if beats_notes:  # 如果解析成功，使用原曲 BPM
         try:
@@ -828,7 +831,7 @@ def main():
                 break
 
             frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
-            frame = cv2.resize(frame, (int(frame.shape[1] * 0.7), int(frame.shape[0] * 0.7)))
+            frame = cv2.resize(frame, (int(frame.shape[1] * 0.9), int(frame.shape[0] * 0.9)))
 
             check_and_trigger_tuning(frame)
 
