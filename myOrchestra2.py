@@ -15,17 +15,9 @@ midi_queue = Queue()
 
 
 
-class ProgramState(Enum):
-    INITIALIZING_BPM = 1
-    PLAYING_MIDI = 2
-    EXITING = 3
-
-
-
 current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
 global_time_signature = (4, 4)
-prev_control_position = None
 tuning_active = False
 
 
@@ -52,42 +44,28 @@ playback_thread = None
 stop_playback = False
 
 
-# 在全局变量定义区添加以下变量
 pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.4, min_tracking_confidence=0.4)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
 
-# 新增全局变量
 prev_palm_position = None  # 用于记录上一帧手掌位置
-volume = 100  # 初始音量
-
-
+volume = 150  # 初始音量
 fluid_lock = Lock()
-
 STOP_THRESHOLD = 20
 STOP_DURATION = 0.02
 NOTE_INTERVAL = 0.4  
 velocity = 64
 bpm = 120 
-
 prev_position = None
 prev_time = None
 last_stop_time = None
-prev_direction = None
 current_beat = 0
-play_parameters = {"velocity": velocity, "volume": volume}
-
-
-last_stop_position = None
-motion_distance_since_last_stop = 0
-trajectory = deque(maxlen=30)
-animation_point = None
-animation_start_time = None
-animation_duration = 0.5
-
 root = Tk()
 root.withdraw()
+current_playback_position = 0.0  # 当前播放位置（秒）
+playback_events = []  # 预处理的全局播放事件列表
+
 
 fs = None  # FluidSynth instance
 
@@ -208,18 +186,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             new_last_stop_time = time.time()
                         process_frame_with_hand_detection.last_swing_time = time.time()
 
-            prev_position = wrist_pos.copy()  # 存储为numpy数组
+            prev_position = wrist_pos.copy()
             cv2.circle(frame, tuple(wrist_pos), 8, (0, 255, 0), -1)
 
-        # 变化手逻辑（使用numpy优化距离计算）
         if control_hand and torso_center_px is not None:
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
             control_wrist_pos = np.array([
                 control_wrist.x * frame.shape[1],
                 control_wrist.y * frame.shape[0]
             ]).astype(int)
-            
-            # 计算到躯干中心的距离
+
             torso_center = np.array(torso_center_px)
             distance_to_torso = np.linalg.norm(control_wrist_pos - torso_center)
             current_time = time.time()
@@ -329,10 +305,6 @@ def calculate_note_durations(bpm, time_signature=global_time_signature):
         "4th": beat_duration,
     }
 
-
-root = Tk()
-root.withdraw()
-
 midi_file_path = filedialog.askopenfilename(title="选择 MIDI 文件", filetypes=[("MIDI 文件", "*.mid"), ("所有文件", "*.*")])
 if not midi_file_path:
     print("未选择 MIDI 文件，程序退出。")
@@ -341,17 +313,11 @@ if not midi_file_path:
 
 
 
-
-
 import pretty_midi
 
 from mido import MidiFile, MidiTrack, MetaMessage, Message
 import pretty_midi
 
-
-current_playback_position = 0.0  # 当前播放位置（秒）
-is_auto_playing = False
-playback_events = []  # 预处理的全局播放事件列表
 
 
 def preprocess_midi(midi_file_path):
@@ -715,45 +681,32 @@ def main():
             cleanup_fluidsynth()
             exit()
 
-    # 计算音符时值
     print(f"使用原曲BPM:{bpm:.2f}")
     note_durations = calculate_note_durations(bpm)
 
-    # 初始化手势相关变量
     stop_detected = False
     prev_position = None
     current_beat = 0
-    last_stop_time = None  # 初始化 last_stop_time
-
-    # 启动 MIDI 事件处理线程
+    last_stop_time = None  
     midi_thread = threading.Thread(target=midi_event_processor, daemon=True)
     midi_thread.start()
 
     try:
         while True:
-            # 读取摄像头帧
             ret, frame = cap.read()
             if not ret:
                 print("无法读取摄像头帧，退出程序。")
                 break
 
-            frame = cv2.flip(frame, 1)  # 镜像翻转以获得正确视角
-            frame = cv2.resize(frame, (int(frame.shape[1] * 0.9), int(frame.shape[0] * 0.9)))
+            frame = cv2.flip(frame, 1)
+            frame = cv2.resize(frame, (int(frame.shape[1] * 0.9), int(frame.shape[0] * 0.9))) #摄像头尺寸
 
             check_and_trigger_tuning(frame)
-
-            # MIDI 播放流程
             prev_position, stop_detected, current_beat, last_stop_time, play_beat_command, current_bpm = process_frame_with_hand_detection(
                 frame, None, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time
             )
-
-            # 动态播放 MIDI 音符
             play_midi_beat_persistent(beats_notes, play_beat_command, current_bpm, volume, frame)
-
-            # 显示摄像头帧
             cv2.imshow("Hand Gesture MIDI Control", frame)
-
-            # 退出程序
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
