@@ -25,6 +25,7 @@ current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
 global_time_signature = (4, 4)
 prev_control_position = None
+tuning_active = False
 
 
 global_active_notes = {}  # 格式: {(channel, pitch): {"end_sec": float, "velocity": int}}
@@ -35,7 +36,7 @@ global_notes_lock = threading.Lock()
 # 初始化 MediaPipe Hands
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.3, min_tracking_confidence=0.3)
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 
 rhythm_hand_label = None  # 节奏手的左右信息（"Left" 或 "Right"）
@@ -51,7 +52,7 @@ stop_playback = False
 
 
 # 在全局变量定义区添加以下变量
-pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.3, min_tracking_confidence=0.3)
+pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.4, min_tracking_confidence=0.4)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
@@ -65,10 +66,9 @@ fluid_lock = Lock()
 
 STOP_THRESHOLD = 20
 STOP_DURATION = 0.02
-NOTE_INTERVAL = 0.1  # Interval between playing consecutive notes within a beat (seconds)
-
+NOTE_INTERVAL = 0.4  
 velocity = 64
-bpm = 120  # Initial BPM based on test bar
+bpm = 120 
 
 prev_position = None
 prev_time = None
@@ -112,7 +112,7 @@ def select_midi_and_soundfont_files():
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
 
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
-    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock
+    global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock, tuning_active
 
     # 初始化控制信号变量
     play_beat_command = False      # 节拍播放触发标志
@@ -120,14 +120,12 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     new_last_stop_time = last_stop_time  # 用于存储新的挥手时间
 
     speed_threshold = 120
-    distance_threshold = 70
-    MIN_INTERVAL = 0.1            # 最小挥手间隔（秒）
+    distance_threshold = 80
+    MIN_INTERVAL = 0.4            # 最小挥手间隔（秒）
 
-    # 静态变量：记录上一次挥手时间以及是否在等待手势放缓
+    # 静态变量：记录上一次挥手时间
     if not hasattr(process_frame_with_hand_detection, "last_swing_time"):
         process_frame_with_hand_detection.last_swing_time = None
-    if not hasattr(process_frame_with_hand_detection, "waiting_for_rest"):
-        process_frame_with_hand_detection.waiting_for_rest = False
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -141,18 +139,21 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
     torso_center = None
     if pose_result.pose_landmarks:
-        # mp_drawing.draw_landmarks(frame, pose_result.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
         left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
         torso_center = (
             int((left_shoulder.x + right_shoulder.x) / 2 * frame.shape[1]),
             int((left_shoulder.y + right_shoulder.y) / 2 * frame.shape[0])
         )
-        #cv2.circle(frame, torso_center, 5, (0, 255, 0), -1)
 
     if hand_result.multi_hand_landmarks and hand_result.multi_handedness:
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
+
+        # 在 tuning 阶段绘制手部骨骼
+        if tuning_active:
+            for hand_landmarks in hand_landmarks_list:
+                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
@@ -183,28 +184,24 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 dy = wrist_pos[1] - prev_position[1]
                 distance = (dx**2 + dy**2)**0.5
                 if distance > distance_threshold and (distance > 0):
-                    if not process_frame_with_hand_detection.waiting_for_rest:
-                        with global_notes_lock:
-                            active_non_cross = any(
-                                not note_info.get("cross_beat", False)
-                                for note_info in global_active_notes.values()
-                            )
-                        if active_non_cross:
-                            play_beat_command = False
-                        else:
-                            if process_frame_with_hand_detection.last_swing_time is not None:
-                                interval = time.time() - process_frame_with_hand_detection.last_swing_time
-                                if interval >= MIN_INTERVAL:
-                                    current_bpm = max(60, min(200, 60 / interval))
-                                    print(f"检测到动态 BPM: {current_bpm:.2f}")
-                                    play_beat_command = True
-                                    new_last_stop_time = time.time()
-                            else:
+                    with global_notes_lock:
+                        active_non_cross = any(
+                            not note_info.get("cross_beat", False)
+                            for note_info in global_active_notes.values()
+                        )
+                    if active_non_cross:
+                        play_beat_command = False
+                    else:
+                        if process_frame_with_hand_detection.last_swing_time is not None:
+                            interval = time.time() - process_frame_with_hand_detection.last_swing_time
+                            if interval >= MIN_INTERVAL:
+                                current_bpm = max(60, min(200, 60 / interval))
+                                print(f"更新动态 BPM: {current_bpm:.2f}")
+                                play_beat_command = True
                                 new_last_stop_time = time.time()
-                            process_frame_with_hand_detection.last_swing_time = time.time()
-                            process_frame_with_hand_detection.waiting_for_rest = True
-                else:
-                    process_frame_with_hand_detection.waiting_for_rest = False
+                        else:
+                            new_last_stop_time = time.time()
+                        process_frame_with_hand_detection.last_swing_time = time.time()
 
             prev_position = wrist_pos
             cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
@@ -218,8 +215,8 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                 current_time = time.time()
 
                 if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
-                    up_threshold = tuning_baseline_distance + 100
-                    down_threshold = tuning_baseline_distance - 100
+                    up_threshold = tuning_baseline_distance + 80
+                    down_threshold = tuning_baseline_distance - 80
                     if distance_to_torso > up_threshold:
                         extra = distance_to_torso - up_threshold
                         increments = int(extra // 30)
@@ -229,7 +226,6 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                         decrements = int(extra // 30)
                         velocity = max(10, velocity - decrements * 8)
                     else:
-                        # 距离在上下限之间，按每秒15的速率回退至64
                         dt = current_time - last_volume_update_time if last_volume_update_time else 0.2
                         diff = 64 - velocity
                         change = 15 * dt
@@ -240,18 +236,12 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                                 velocity += change
                             else:
                                 velocity -= change
-                else:
-                    pass
 
                 with fluid_lock:
                     fs.cc(0, 7, int(velocity))
                 last_volume_update_time = current_time
-                #cv2.putText(frame, f"Distance: {distance_to_torso:.2f}", (10, 100),
-                            #cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
-    cv2.putText(frame, f"Play Command: {play_beat_command}", (10, 200),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
     cv2.putText(frame, f"Velocity: {int(velocity)}", (10, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
@@ -266,16 +256,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
 
 
 
-
+#未调用功能，可以自我发挥
 def calculate_angle(vec1, vec2):
-    """计算两向量之间的夹角（单位：度）"""
+
     dot_product = vec1[0] * vec2[0] + vec1[1] * vec2[1]
     magnitude1 = (vec1[0]**2 + vec1[1]**2)**0.5
     magnitude2 = (vec2[0]**2 + vec2[1]**2)**0.5
     if magnitude1 == 0 or magnitude2 == 0:
         return 0  # 防止除以零
     cos_theta = dot_product / (magnitude1 * magnitude2)
-    cos_theta = max(-1, min(1, cos_theta))  # 防止浮点误差导致超出范围
+    cos_theta = max(-1, min(1, cos_theta)) 
     return math.degrees(math.acos(cos_theta))
 
 
@@ -305,7 +295,7 @@ def start_fluidsynth():
 
 
 def cleanup_fluidsynth():
-    """Clean up FluidSynth resources. Ensure it is called only once."""
+
     global fs, playback_thread
 
     if playback_thread and playback_thread.is_alive():
@@ -332,9 +322,6 @@ def calculate_note_durations(bpm, time_signature=global_time_signature):
     }
 
 
-
-
-# GUI setup and MIDI preprocessing logic
 root = Tk()
 root.withdraw()
 
@@ -360,12 +347,7 @@ playback_events = []  # 预处理的全局播放事件列表
 
 
 def preprocess_midi(midi_file_path):
-    """
-    解析 MIDI 文件并提取多声部音符数据  
-    返回值：all_voices_notes, ticks_per_beat, bpm  
-    同时提取拍号信息，保存到全局变量 global_time_signature  
-    为每个声部新增 'next_note_index' 用于记录下一次要播放的音符索引。
-    """
+
     global sfid, global_time_signature
 
     try:
@@ -452,9 +434,7 @@ from queue import Queue
 import threading
 
 def detect_pause_and_calculate_bpm(centroid, current_time, frame):
-    """
-    检测停顿后动态更新 BPM，并播放对应节拍音符，同时更新动画。
-    """
+
     global last_stop_time, bpm, note_durations, last_pause_info
 
     if last_stop_time is not None:
@@ -483,10 +463,7 @@ def detect_pause_and_calculate_bpm(centroid, current_time, frame):
 
 
 def detect_pause(motion_amplitude, prev_position, current_position, stop_detected):
-    """
-    通用的停顿检测逻辑，用于检测手势停顿。
-    返回停顿状态和更新后的运动幅度缓冲区。
-    """
+
     STOP_THRESHOLD = 30  # 停顿运动幅度阈值
     dx = current_position[0] - prev_position[0]
     dy = current_position[1] - prev_position[1]
@@ -510,12 +487,7 @@ def detect_pause(motion_amplitude, prev_position, current_position, stop_detecte
 
 
 def midi_event_processor():
-    """
-    修改后的 MIDI 事件处理线程：
-      - 处理 note_on 和 note_off 事件；
-      - 所有 note_off 事件都将被正常执行，确保跨拍音符在到达预定时长后能被关闭，
-        避免出现无限延长的问题。
-    """
+
     global fs, stop_playback, fluid_lock, global_active_notes, global_notes_lock, midi_queue, current_beat
     while True:
         event = midi_queue.get()  # 阻塞等待事件
@@ -542,11 +514,7 @@ def midi_event_processor():
 
 
 def panic_non_cross_notes():
-    """
-    关闭所有正在播放的非跨拍音符，
-    使得当新的 play beat 指令触发时，仅中断上一拍中已启动且不跨拍的音符，
-    而跨拍音符依然可以继续播放。
-    """
+
     global fs, global_active_notes, global_notes_lock, fluid_lock
     with fluid_lock:
         with global_notes_lock:
@@ -680,25 +648,19 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     
 
 def trigger_tuning():
-
-    global fs, fluid_lock
-    # 播放 A4 音
-    with fluid_lock:
-        for channel in range(16):
-            try:
-                fs.noteon(channel, 69, 127)
-            except Exception as e:
-                print(f"Error in tuning noteon on channel {channel}: {e}")
-    # 持续 1 秒
-    time.sleep(2)
-    # 关闭 A4 音
-    with fluid_lock:
-        for channel in range(16):
-            try:
-                fs.noteoff(channel, 69)
-            except Exception as e:
-                print(f"Error in tuning noteoff on channel {channel}: {e}")
-    print("Tuning triggered: A4 played for 1 second.")
+    global fs, fluid_lock, tuning_active
+    tuning_active = True  # 开始 tuning，打开手部骨骼绘制
+    try:
+        with fluid_lock:
+            for channel in range(16):
+                fs.noteon(channel, 69, 127)  # 播放 A4 音
+        time.sleep(2)
+        with fluid_lock:
+            for channel in range(16):
+                fs.noteoff(channel, 69)  # 停止 A4 音
+        print("Tuning completed: A4 played for 1 second.")
+    finally:
+        tuning_active = False  # 结束 tuning，关闭手部骨骼绘制
 
 
 def check_and_trigger_tuning(frame):
@@ -768,9 +730,6 @@ def check_and_trigger_tuning(frame):
                     tuning_baseline_distance = baseline_distance
                     print(f"Tuning Baseline Distance: {tuning_baseline_distance:.2f}")
                 threading.Thread(target=trigger_tuning, daemon=True).start()
-
-
-
 
 
 
