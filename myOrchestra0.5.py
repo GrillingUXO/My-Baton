@@ -102,9 +102,11 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     distance_threshold = 80
     MIN_INTERVAL = 0.4            # 最小挥手间隔（秒）
 
-    # 静态变量：记录上一次挥手时间
+    # 静态变量：记录上一次挥手时间和上一次velocity值
     if not hasattr(process_frame_with_hand_detection, "last_swing_time"):
         process_frame_with_hand_detection.last_swing_time = None
+    if not hasattr(process_frame_with_hand_detection, "last_velocity"):
+        process_frame_with_hand_detection.last_velocity = velocity
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -203,12 +205,14 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             #cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
 
         if control_hand:
+            current_time = time.time()
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
             control_wrist_pos = (int(control_wrist.x * frame.shape[1]), int(control_wrist.y * frame.shape[0]))
+            original_velocity = velocity  # 记录修改前的velocity值
+
             if torso_center:
                 distance_to_torso = ((control_wrist_pos[0] - torso_center[0])**2 +
                                      (control_wrist_pos[1] - torso_center[1])**2)**0.5
-                current_time = time.time()
 
                 if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
                     up_threshold = tuning_baseline_distance + 80
@@ -233,14 +237,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             else:
                                 velocity -= change
 
+            # 仅在velocity变化时输出
+            if process_frame_with_hand_detection.last_velocity != velocity:
+                print(int(velocity))
+                process_frame_with_hand_detection.last_velocity = velocity
+
             with fluid_lock:
                 for channel in range(16): 
                     fs.cc(channel, 7, int(velocity)) 
-                    
                 last_volume_update_time = current_time
             #cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
-
-    print(int(velocity))
 
     return (
         prev_position,
@@ -250,7 +256,6 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         play_beat_command,
         current_bpm
     )
-
 
 #未调用功能，可以自我发挥
 def calculate_angle(vec1, vec2):
@@ -572,6 +577,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     playback_thread.start()
 
     
+
 def trigger_tuning():
     global fs, fluid_lock, tuning_active
     tuning_active = True  # 开始 tuning
@@ -655,6 +661,7 @@ def check_and_trigger_tuning(frame):
                     tuning_baseline_distance = baseline_distance
                     print(f"Tuning Baseline Distance: {tuning_baseline_distance:.2f}")
                 threading.Thread(target=trigger_tuning, daemon=True).start()
+
 
 
 
