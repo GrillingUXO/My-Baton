@@ -224,7 +224,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             velocity -= change
 
             with fluid_lock:
-                fs.cc(0, 7, int(velocity))
+                for channel in range(16):
+                    fs.cc(channel, 7, int(velocity))
+                    
             last_volume_update_time = current_time
             cv2.circle(frame, tuple(control_wrist_pos), 8, (0, 0, 255), -1)
 
