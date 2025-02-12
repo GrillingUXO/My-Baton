@@ -15,17 +15,9 @@ midi_queue = Queue()
 
 
 
-class ProgramState(Enum):
-    INITIALIZING_BPM = 1
-    PLAYING_MIDI = 2
-    EXITING = 3
-
-
-
 current_beat = 0                 # 当前播放的拍子序号
 beat_lock = threading.Lock()     # 节拍计数器锁
 global_time_signature = (4, 4)
-prev_control_position = None
 tuning_active = False
 
 
@@ -52,42 +44,28 @@ playback_thread = None
 stop_playback = False
 
 
-# 在全局变量定义区添加以下变量
 pose = mp.solutions.pose.Pose(static_image_mode=False, min_detection_confidence=0.4, min_tracking_confidence=0.4)
 last_volume_update_time = None  # 上一次音量调整的时间戳
 velocity = 64  # 初始音量（0-127）
 
 
-# 新增全局变量
 prev_palm_position = None  # 用于记录上一帧手掌位置
-volume = 100  # 初始音量
-
-
+volume = 150  # 初始音量
 fluid_lock = Lock()
-
 STOP_THRESHOLD = 20
 STOP_DURATION = 0.02
 NOTE_INTERVAL = 0.4  
 velocity = 64
 bpm = 120 
-
 prev_position = None
 prev_time = None
 last_stop_time = None
-prev_direction = None
 current_beat = 0
-play_parameters = {"velocity": velocity, "volume": volume}
-
-
-last_stop_position = None
-motion_distance_since_last_stop = 0
-trajectory = deque(maxlen=30)
-animation_point = None
-animation_start_time = None
-animation_duration = 0.5
-
 root = Tk()
 root.withdraw()
+current_playback_position = 0.0  # 当前播放位置（秒）
+playback_events = []  # 预处理的全局播放事件列表
+
 
 fs = None  # FluidSynth instance
 
@@ -111,6 +89,7 @@ def select_midi_and_soundfont_files():
 
 
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
+
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
     global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock, tuning_active
 
@@ -120,7 +99,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     new_last_stop_time = last_stop_time  # 用于存储新的挥手时间
 
     speed_threshold = 120
-    distance_threshold = 160  # 修改点：曼哈顿距离阈值（原欧氏80对应约160）
+    distance_threshold = 80
     MIN_INTERVAL = 0.4            # 最小挥手间隔（秒）
 
     # 静态变量：记录上一次挥手时间
@@ -173,16 +152,16 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
             elif label == control_hand_label:
                 control_hand = hand_landmarks_list[idx]
 
-        # 节奏手逻辑（关键修改点）
+        # 节奏手逻辑
         if rhythm_hand:
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
             wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
-            # 挥手触发检测（改为曼哈顿距离）
+            # 挥手触发检测
             if prev_position is not None:
                 dx = wrist_pos[0] - prev_position[0]
                 dy = wrist_pos[1] - prev_position[1]
-                distance = abs(dx) + abs(dy)  # 修改点：欧氏→曼哈顿
+                distance = (dx**2 + dy**2)**0.5
                 if distance > distance_threshold and (distance > 0):
                     with global_notes_lock:
                         active_non_cross = any(
@@ -237,8 +216,10 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             else:
                                 velocity -= change
 
-                with fluid_lock:
-                    fs.cc(0, 7, int(velocity))
+            with fluid_lock:
+                for channel in range(16): 
+                    fs.cc(channel, 7, int(velocity)) 
+                    
                 last_volume_update_time = current_time
             cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
@@ -320,10 +301,6 @@ def calculate_note_durations(bpm, time_signature=global_time_signature):
         "4th": beat_duration,
     }
 
-
-root = Tk()
-root.withdraw()
-
 midi_file_path = filedialog.askopenfilename(title="选择 MIDI 文件", filetypes=[("MIDI 文件", "*.mid"), ("所有文件", "*.*")])
 if not midi_file_path:
     print("未选择 MIDI 文件，程序退出。")
@@ -332,17 +309,11 @@ if not midi_file_path:
 
 
 
-
-
 import pretty_midi
 
 from mido import MidiFile, MidiTrack, MetaMessage, Message
 import pretty_midi
 
-
-current_playback_position = 0.0  # 当前播放位置（秒）
-is_auto_playing = False
-playback_events = []  # 预处理的全局播放事件列表
 
 
 def preprocess_midi(midi_file_path):
@@ -429,62 +400,6 @@ total_beats = len(beats_notes)
 last_pause_info = {"bpm": None, "tap_times": []}
 
 
-from queue import Queue
-import threading
-
-def detect_pause_and_calculate_bpm(centroid, current_time, frame):
-
-    global last_stop_time, bpm, note_durations, last_pause_info
-
-    if last_stop_time is not None:
-        interval = current_time - last_stop_time
-        if interval > 0:
-            bpm = max(60, min(200, 60 / interval))  # 限制 BPM 范围
-            note_durations = calculate_note_durations(bpm)
-            print(f"动态更新 BPM：{bpm:.2f}")
-
-    last_stop_time = current_time
-
-    # 更新停顿记录
-    if "tap_times" in last_pause_info:
-        last_pause_info["tap_times"].append(current_time)
-    else:
-        last_pause_info["tap_times"] = [current_time]
-    last_pause_info["bpm"] = bpm
-
-    # 显示动画
-    for idx, tap_time in enumerate(last_pause_info["tap_times"][-4:], 1):
-        cv2.putText(frame, f"Stop {idx}: {tap_time:.2f}s", (10, 60 + idx * 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-
-
-
-
-
-def detect_pause(motion_amplitude, prev_position, current_position, stop_detected):
-
-    STOP_THRESHOLD = 30  # 停顿运动幅度阈值
-    dx = current_position[0] - prev_position[0]
-    dy = current_position[1] - prev_position[1]
-    distance = (dx**2 + dy**2)**0.5
-    motion_amplitude.append(distance)
-
-    # 保持缓冲区长度为 10
-    if len(motion_amplitude) > 10:
-        motion_amplitude.pop(0)
-
-    avg_motion = np.mean(motion_amplitude)
-
-    if avg_motion < STOP_THRESHOLD:
-        if not stop_detected:
-            stop_detected = True
-            return True, motion_amplitude, stop_detected
-    else:
-        stop_detected = False  # 停顿结束时清除标记
-
-    return False, motion_amplitude, stop_detected
-
-
 def midi_event_processor():
 
     global fs, stop_playback, fluid_lock, global_active_notes, global_notes_lock, midi_queue, current_beat
@@ -547,17 +462,13 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     # 如果已有播放线程正在运行，判断当前进度
     if playback_thread and playback_thread.is_alive():
         current_progress = time.perf_counter() - global_playback_start_time
-        if current_progress < beat_duration * 0.75:
-            # 如果尚未进入当前拍的后 25%，则忽略新的 play beat 条件
+        if current_progress < beat_duration * 0.6:
             return
         else:
-            # 当前拍已进入后 25%，中断当前非跨拍音符的播放：
             interrupt_flag = True
             panic_non_cross_notes()
-            # 等待一点时间以确保播放线程能响应中断标志（不阻塞太久）
-            time.sleep(0.05)
+            time.sleep(0.02)
 
-    # 更新拍子相关信息（使用 beat_lock 保护对 current_beat 的更新）
     with beat_lock:
         current_beat += 1
         # 重置中断标志，便于新拍的事件调度
@@ -731,6 +642,8 @@ def check_and_trigger_tuning(frame):
                 threading.Thread(target=trigger_tuning, daemon=True).start()
 
 
+
+
 def main():
     global tuning_triggered
     tuning_triggered = False 
@@ -809,13 +722,6 @@ def main():
                 play_midi_beat_persistent(beats_notes, play_beat_command, current_bpm, volume, processed_frame)
                 last_processed_frame = processed_frame  # 保存处理结果
                 display_frame = processed_frame
-            else:
-                # 使用上次处理结果+当前帧背景混合
-                if last_processed_frame is not None:
-                    # 混合策略：70%历史绘图 + 30%当前背景
-                    display_frame = cv2.addWeighted(last_processed_frame, 0.7, frame, 0.3, 0)
-                else:
-                    display_frame = frame  # 首帧直接显示
 
             # 始终显示画面（保持流畅）
             cv2.imshow("Hand Gesture MIDI Control", display_frame)
@@ -831,6 +737,7 @@ def main():
         cv2.destroyAllWindows()
         cleanup_fluidsynth()
         
+
 if __name__ == '__main__':
     main()
     
