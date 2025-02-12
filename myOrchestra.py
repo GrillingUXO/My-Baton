@@ -89,6 +89,7 @@ def select_midi_and_soundfont_files():
 
 
 def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_detected, current_beat, beats_notes, total_beats, last_stop_time):
+
     global hands, mp_drawing, mp_hands, pose, bpm, motion_amplitude, last_pause_info, playback_thread, stop_playback
     global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock, tuning_active
 
@@ -115,24 +116,20 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         pose_result = future_pose.result()
         hand_result = future_hands.result()
 
-    torso_center_px = None
+    torso_center = None
     if pose_result.pose_landmarks:
-        landmarks = pose_result.pose_landmarks.landmark
-        left_shoulder = np.array([
-            landmarks[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value].x,
-            landmarks[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value].y
-        ])
-        right_shoulder = np.array([
-            landmarks[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-            landmarks[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value].y
-        ])
-        torso_center = np.mean([left_shoulder, right_shoulder], axis=0)
-        torso_center_px = (torso_center * [frame.shape[1], frame.shape[0]]).astype(int)
+        left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
+        right_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
+        torso_center = (
+            int((left_shoulder.x + right_shoulder.x) / 2 * frame.shape[1]),
+            int((left_shoulder.y + right_shoulder.y) / 2 * frame.shape[0])
+        )
 
     if hand_result.multi_hand_landmarks and hand_result.multi_handedness:
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
+        # 在 tuning 阶段绘制手部骨骼
         if tuning_active:
             for hand_landmarks in hand_landmarks_list:
                 mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
@@ -158,14 +155,13 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         # 节奏手逻辑
         if rhythm_hand:
             wrist = rhythm_hand.landmark[mp_hands.HandLandmark.WRIST]
-            wrist_pos = np.array([wrist.x * frame.shape[1], wrist.y * frame.shape[0]]).astype(int)
+            wrist_pos = (int(wrist.x * frame.shape[1]), int(wrist.y * frame.shape[0]))
 
+            # 挥手触发检测
             if prev_position is not None:
-                prev_pos = np.array(prev_position)
-                current_pos = np.array(wrist_pos)
-                displacement = current_pos - prev_pos
-                distance = np.linalg.norm(displacement)
-                
+                dx = wrist_pos[0] - prev_position[0]
+                dy = wrist_pos[1] - prev_position[1]
+                distance = (dx**2 + dy**2)**0.5
                 if distance > distance_threshold and (distance > 0):
                     with global_notes_lock:
                         active_non_cross = any(
@@ -186,61 +182,59 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                             new_last_stop_time = time.time()
                         process_frame_with_hand_detection.last_swing_time = time.time()
 
-            prev_position = wrist_pos.copy()
-            cv2.circle(frame, tuple(wrist_pos), 8, (0, 255, 0), -1)
+            prev_position = wrist_pos
+            cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
 
-        if control_hand and torso_center_px is not None:
+        if control_hand:
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
-            control_wrist_pos = np.array([
-                control_wrist.x * frame.shape[1],
-                control_wrist.y * frame.shape[0]
-            ]).astype(int)
+            control_wrist_pos = (int(control_wrist.x * frame.shape[1]), int(control_wrist.y * frame.shape[0]))
+            if torso_center:
+                distance_to_torso = ((control_wrist_pos[0] - torso_center[0])**2 +
+                                     (control_wrist_pos[1] - torso_center[1])**2)**0.5
+                current_time = time.time()
 
-            torso_center = np.array(torso_center_px)
-            distance_to_torso = np.linalg.norm(control_wrist_pos - torso_center)
-            current_time = time.time()
-
-            if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
-                up_threshold = tuning_baseline_distance + 80
-                down_threshold = tuning_baseline_distance - 80
-                if distance_to_torso > up_threshold:
-                    extra = distance_to_torso - up_threshold
-                    increments = int(extra // 30)
-                    velocity = min(127, velocity + increments * 8)
-                elif distance_to_torso < down_threshold:
-                    extra = down_threshold - distance_to_torso
-                    decrements = int(extra // 30)
-                    velocity = max(10, velocity - decrements * 8)
-                else:
-                    dt = current_time - last_volume_update_time if last_volume_update_time else 0.2
-                    diff = 64 - velocity
-                    change = 15 * dt
-                    if abs(diff) < change:
-                        velocity = 64
+                if 'tuning_baseline_distance' in globals() and tuning_baseline_distance is not None:
+                    up_threshold = tuning_baseline_distance + 80
+                    down_threshold = tuning_baseline_distance - 80
+                    if distance_to_torso > up_threshold:
+                        extra = distance_to_torso - up_threshold
+                        increments = int(extra // 30)
+                        velocity = min(127, velocity + increments * 8)
+                    elif distance_to_torso < down_threshold:
+                        extra = down_threshold - distance_to_torso
+                        decrements = int(extra // 30)
+                        velocity = max(10, velocity - decrements * 8)
                     else:
-                        if diff > 0:
-                            velocity += change
+                        dt = current_time - last_volume_update_time if last_volume_update_time else 0.2
+                        diff = 64 - velocity
+                        change = 15 * dt
+                        if abs(diff) < change:
+                            velocity = 64
                         else:
-                            velocity -= change
+                            if diff > 0:
+                                velocity += change
+                            else:
+                                velocity -= change
 
             with fluid_lock:
-                for channel in range(16):
-                    fs.cc(channel, 7, int(velocity))
+                for channel in range(16): 
+                    fs.cc(channel, 7, int(velocity)) 
                     
-            last_volume_update_time = current_time
-            cv2.circle(frame, tuple(control_wrist_pos), 8, (0, 0, 255), -1)
+                last_volume_update_time = current_time
+            cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
     cv2.putText(frame, f"Velocity: {int(velocity)}", (10, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
     return (
-        prev_position.tolist() if isinstance(prev_position, np.ndarray) else prev_position,
+        prev_position,
         stop_detected,
         current_beat,
         new_last_stop_time if 'new_last_stop_time' in locals() else last_stop_time,
         play_beat_command,
         current_bpm
     )
+
 
 #未调用功能，可以自我发挥
 def calculate_angle(vec1, vec2):
