@@ -129,11 +129,28 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
-        # 在 tuning 阶段绘制手部骨骼
+        # 在 tuning 阶段绘制手部骨骼，并区分节奏手和变化手的颜色
         if tuning_active:
-            for hand_landmarks in hand_landmarks_list:
-                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            for idx, hand_landmarks in enumerate(hand_landmarks_list):
+                handedness = handedness_list[idx]
+                label = handedness.classification[0].label
+                # 如果对应标签已设置，则使用指定颜色，否则按默认绘制
+                if rhythm_hand_label is not None and label == rhythm_hand_label:
+                    mp_drawing.draw_landmarks(
+                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
+                    )
+                elif control_hand_label is not None and label == control_hand_label:
+                    mp_drawing.draw_landmarks(
+                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2),
+                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                    )
+                else:
+                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
+        # 若节奏手或变化手标签未设置，则按照原逻辑赋值
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
                 label = handedness.classification[0].label
@@ -183,7 +200,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                         process_frame_with_hand_detection.last_swing_time = time.time()
 
             prev_position = wrist_pos
-            cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
+            #cv2.circle(frame, wrist_pos, 8, (0, 255, 0), -1)
 
         if control_hand:
             control_wrist = control_hand.landmark[mp_hands.HandLandmark.WRIST]
@@ -221,10 +238,9 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
                     fs.cc(channel, 7, int(velocity)) 
                     
                 last_volume_update_time = current_time
-            cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
+            #cv2.circle(frame, control_wrist_pos, 8, (0, 0, 255), -1)
 
-    cv2.putText(frame, f"Velocity: {int(velocity)}", (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    print(int(velocity))
 
     return (
         prev_position,
@@ -544,7 +560,7 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
                     # 如果中断标志被置且当前事件为 note_on 且非跨拍，则跳出等待
                     if (stop_playback or interrupt_flag) and event["type"] == "note_on" and not event.get("cross_beat", False):
                         break
-                    time.sleep(0.01)
+                    time.sleep(0.05)
                 # 若中断后遇到非跨拍的 note_on 事件，则跳过该事件
                 if (stop_playback or interrupt_flag) and event["type"] == "note_on" and not event.get("cross_beat", False):
                     continue
@@ -556,7 +572,6 @@ def play_midi_beat_persistent(all_voices_notes, play_beat_command, current_bpm, 
     playback_thread.start()
 
     
-
 def trigger_tuning():
     global fs, fluid_lock, tuning_active
     tuning_active = True  # 开始 tuning
@@ -640,7 +655,6 @@ def check_and_trigger_tuning(frame):
                     tuning_baseline_distance = baseline_distance
                     print(f"Tuning Baseline Distance: {tuning_baseline_distance:.2f}")
                 threading.Thread(target=trigger_tuning, daemon=True).start()
-
 
 
 
