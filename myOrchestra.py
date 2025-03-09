@@ -92,21 +92,20 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
     global rhythm_hand_label, control_hand_label, velocity, last_volume_update_time, global_active_notes, global_notes_lock, tuning_active
 
     # 初始化控制信号变量
-    play_beat_command = False      # 节拍播放触发标志
-    current_bpm = bpm              # 当前计算的 BPM
-    new_last_stop_time = last_stop_time  # 用于存储新的挥手时间
+    play_beat_command = False
+    current_bpm = bpm
+    new_last_stop_time = last_stop_time
 
     speed_threshold = 120
     distance_threshold = 80
-    MIN_INTERVAL = 0.4            # 最小挥手间隔（秒）
+    MIN_INTERVAL = 0.4  
 
-    # 静态变量：记录上一次挥手时间
     if not hasattr(process_frame_with_hand_detection, "last_swing_time"):
         process_frame_with_hand_detection.last_swing_time = None
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # 使用线程池并行处理姿态与手部检测
+    # 处理手部检测（并行计算姿态和手部检测）
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_pose = executor.submit(pose.process, rgb_frame)
@@ -114,6 +113,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         pose_result = future_pose.result()
         hand_result = future_hands.result()
 
+    # 计算躯干中心
     torso_center = None
     if pose_result.pose_landmarks:
         left_shoulder = pose_result.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
@@ -127,10 +127,8 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         hand_landmarks_list = hand_result.multi_hand_landmarks
         handedness_list = hand_result.multi_handedness
 
-        # 在 tuning 阶段绘制手部骨骼
-        if tuning_active:
-            for hand_landmarks in hand_landmarks_list:
-                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        for hand_landmarks in hand_landmarks_list:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
         if rhythm_hand_label is None or control_hand_label is None:
             for idx, handedness in enumerate(handedness_list):
@@ -232,6 +230,7 @@ def process_frame_with_hand_detection(frame, hand_hist, prev_position, stop_dete
         play_beat_command,
         current_bpm
     )
+
 
 
 #未调用功能，可以自我发挥
@@ -686,7 +685,7 @@ def main():
                 break
 
             frame = cv2.flip(frame, 1)
-            frame = cv2.resize(frame, (int(frame.shape[1] * 0.9), int(frame.shape[0] * 0.9))) #摄像头尺寸
+            frame = cv2.resize(frame, (int(frame.shape[1]), int(frame.shape[0]))) #摄像头尺寸
 
             check_and_trigger_tuning(frame)
             prev_position, stop_detected, current_beat, last_stop_time, play_beat_command, current_bpm = process_frame_with_hand_detection(
