@@ -2,17 +2,15 @@ import cv2
 import numpy as np
 import time
 from tkinter import Tk, filedialog
-from mido import MidiFile
 from collections import deque
 import fluidsynth
 import threading
 from threading import Lock
 import mediapipe as mp
-from enum import Enum
 import math
 from queue import Queue
 midi_queue = Queue()
-
+import pretty_midi
 
 
 current_beat = 0                 # 当前播放的拍子序号
@@ -327,13 +325,6 @@ if not midi_file_path:
     print("未选择 MIDI 文件，程序退出。")
     cleanup_fluidsynth()
     exit()
-
-
-
-import pretty_midi
-
-from mido import MidiFile, MidiTrack, MetaMessage, Message
-import pretty_midi
 
 
 
