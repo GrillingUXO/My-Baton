@@ -5,7 +5,7 @@
 ```powershell
 $downloadUrl = "https://github.com/FluidSynth/fluidsynth/releases/download/v2.4.4/fluidsynth-2.4.4-win10-x64.zip"
 $outputZip = "C:\tools\fluidsynth.zip"
-$extractPath = "C:\tools\fluidsynth"
+$extractPath = "C:\tools"
 
 if (!(Test-Path "C:\tools")) {
     New-Item -ItemType Directory -Path "C:\tools"
